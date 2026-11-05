@@ -1,0 +1,49 @@
+{
+"classname" "item_armor_body"
+"origin" "100 100 50"
+"angle" "0"
+}
+{
+"classname" "item_armor_body"
+"origin" "500 100 50"
+"angle" "0"
+}
+{
+"classname" "item_armor_shard"
+"origin" "300 250 50"
+"angle" "90"
+"count" "3"
+}
+{
+"classname" "item_armor_shard"
+"origin" "700 250 50"
+"angle" "90"
+"count" "3"
+}
+{
+"classname" "item_health_mega"
+"origin" "400 500 50"
+"angle" "180"
+}
+{
+"classname" "item_health_large"
+"origin" "100 600 50"
+"angle" "270"
+}
+{
+"classname" "item_health_large"
+"origin" "700 600 50"
+"angle" "270"
+}
+{
+"classname" "item_health_small"
+"origin" "250 750 50"
+"angle" "0"
+"count" "5"
+}
+{
+"classname" "item_health_small"
+"origin" "550 750 50"
+"angle" "0"
+"count" "5"
+}

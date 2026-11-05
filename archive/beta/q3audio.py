@@ -1,0 +1,179 @@
+import minqlxtended
+
+class q3audio(minqlxtended.Plugin):
+    def __init__(self):
+        self.add_hook("map", self.map_load)
+        self.add_hook("vote_started", self.handle_vote_started)
+        self.add_hook("vote_ended", self.handle_vote_ended)
+        self.add_hook("game_countdown", self.handle_game_countdown)
+        self.add_hook("game_start", self.handle_game_start)
+        self.add_hook("game_end", self.handle_game_end)
+        self.add_hook("round_countdown", self.handle_round_countdown)
+        self.add_hook("round_start", self.handle_round_start)
+        self.add_hook("round_end", self.handle_round_end)
+        self.add_command("tomtec_versions", self.cmd_showversion)
+
+        self.team_gametypes = ["tdm", "ca", "ctf", "1f", "har", "ft", "dom", "ad", "rr"]
+        self.free_gametypes = ["ffa", "duel", "race"]
+
+        self.stored_score_red = 0
+        self.stored_score_blue = 0
+        
+        self.plugin_version = "0.1"
+
+        self.isFirstRound = True
+            
+    def map_load(self, mapname, factory):
+        self.game.workshop_items += [614429927]
+
+    def handle_vote_started(self, caller, vote, args):
+        @minqlxtended.next_frame
+        def vote_now():
+            self.stop_sound()
+            self.play_sound("q3_audio/vo/vote/vote_now.wav")
+        vote_now()
+        
+    def handle_vote_ended(self, votes, vote, args, passed):
+        @minqlxtended.delay(1.2)
+        def f():
+            self.stop_sound()
+        f()
+        if passed:
+            self.play_sound("q3_audio/vo/vote/vote_passed.wav")
+        else:
+            self.play_sound("q3_audio/vo/vote/vote_failed.wav")
+            
+    def handle_game_countdown(self):
+        if self.game.type_short in self.team_gametypes:
+            @minqlxtended.next_frame
+            def prepare_your_team():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/prepare_your_team.wav")
+            prepare_your_team()
+        elif self.game.type_short in self.free_gametypes:
+            @minqlxtended.next_frame
+            def prepare_to_fight():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/prepare_to_fight.wav")
+            prepare_to_fight()
+
+            @minqlxtended.delay(7)
+            def three():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/3.wav")
+            three()
+
+            @minqlxtended.delay(8)
+            def two():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/2.wav")
+            two()
+
+            @minqlxtended.delay(9)
+            def one():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/1.wav")
+            one()
+
+
+    def handle_round_countdown(self, round_number):
+        if self.isFirstRound:
+            self.isFirstRound = False
+            @minqlxtended.delay(4.6)
+            def stop_round_begins_in():
+                self.stop_sound()
+            stop_round_begins_in()
+
+            @minqlxtended.delay(6.6)
+            def three():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/3.wav")
+            three()
+
+            @minqlxtended.delay(7.6)
+            def two():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/2.wav")
+            two()
+
+            @minqlxtended.delay(8.6)
+            def one():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/1.wav")
+            one()
+        else:
+            @minqlxtended.delay(5)
+            def stop_round_begins_in():
+                self.stop_sound()
+            stop_round_begins_in()
+
+            @minqlxtended.delay(7)
+            def three():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/3.wav")
+            three()
+
+            @minqlxtended.delay(8)
+            def two():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/2.wav")
+            two()
+
+            @minqlxtended.delay(9)
+            def one():
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/gamestates/countdown/1.wav")
+            one()
+        
+    def handle_round_start(self, round_number):
+        @minqlxtended.next_frame
+        def fight():
+            self.stop_sound()
+            self.play_sound("q3_audio/vo/gamestates/countdown/F.wav")
+        fight()
+
+    def handle_round_end(self, round_number, winning_team, time):
+        if self.game.type_short in self.team_gametypes:
+            if self.game.red_score != self.stored_score_red:
+                self.stored_score_red = self.game.red_score
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/teamgame/red_scores.wav")
+            elif self.game.blue_score != self.stored_score_blue:
+                self.stored_score_blue = self.game.blue_score
+                self.stop_sound()
+                self.play_sound("q3_audio/vo/teamgame/blue_scores.wav")
+            
+        
+    def handle_game_start(self):
+        self.stored_score_red = self.game.red_score
+        self.stored_score_blue = self.game.blue_score
+        self.isFirstRound = True
+        if self.game.type_short in self.free_gametypes:
+            self.stop_sound()
+            self.play_sound("q3_audio/vo/gamestates/countdown/F.wav")
+            
+    def handle_game_end(self, aborted):
+        if self.game.type_short == "duel":
+            teams = self.teams()
+            free_team = teams["free"]
+            score1 = free_team[0].score
+            player1 = self.player(free_team[0].id)
+            score2 = free_team[1].score
+            player2 = self.player(free_team[1].id)
+            if score1 > score2:
+                @minqlxtended.next_frame
+                def conclusion():
+                    self.stop_sound()
+                    self.play_sound("q3_audio/vo/gamestates/you_win.wav", player1)
+                    self.play_sound("q3_audio/vo/gamestates/you_lose.wav", player2)
+                conclusion()
+            elif score2 > score1:
+                @minqlxtended.next_frame
+                def conclusion():
+                    self.stop_sound()
+                    self.play_sound("q3_audio/vo/gamestates/you_win.wav", player2)
+                    self.play_sound("q3_audio/vo/gamestates/you_lose.wav", player1)
+                conclusion()
+            
+    def cmd_showversion(self, player, msg, channel):
+        channel.reply("^4q3audio.py^7 - version {}, created by Thomas Jones on 03/02/2016.".format(self.plugin_version))

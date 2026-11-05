@@ -1,0 +1,31 @@
+{
+"classname" "item_armor_body"
+"origin" "100 200 50"
+"angle" "0"
+}
+{
+"classname" "item_armor_shard"
+"origin" "300 400 100"
+"angle" "90"
+}
+{
+"classname" "weapon_rg"
+"origin" "500 600 150"
+"angle" "180"
+}
+{
+"classname" "ammo_cells"
+"origin" "700 800 50"
+"angle" "270"
+}
+{
+"classname" "weapon_sg"
+"origin" "150 250 75"
+"angle" "45"
+}
+{
+"classname" "item_health_small"
+"origin" "350 450 100"
+"angle" "135"
+"count" "2"
+}

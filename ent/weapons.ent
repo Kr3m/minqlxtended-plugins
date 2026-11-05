@@ -1,0 +1,59 @@
+{
+"classname" "weapon_rg"
+"origin" "0 0 32"
+"angle" "0"
+}
+{
+"classname" "weapon_sg"
+"origin" "128 0 32"
+"angle" "90"
+}
+{
+"classname" "weapon_rl"
+"origin" "256 0 32"
+"angle" "180"
+}
+{
+"classname" "weapon_lg"
+"origin" "384 0 32"
+"angle" "270"
+}
+{
+"classname" "weapon_cg"
+"origin" "64 128 32"
+"angle" "45"
+}
+{
+"classname" "weapon_pg"
+"origin" "192 128 32"
+"angle" "135"
+}
+{
+"classname" "weapon_gl"
+"origin" "320 128 32"
+"angle" "225"
+}
+{
+"classname" "ammo_cells"
+"origin" "0 256 32"
+"angle" "0"
+"count" "2"
+}
+{
+"classname" "ammo_slugs"
+"origin" "128 256 32"
+"angle" "90"
+"count" "2"
+}
+{
+"classname" "ammo_rockets"
+"origin" "256 256 32"
+"angle" "180"
+"count" "2"
+}
+{
+"classname" "ammo_belt"
+"origin" "384 256 32"
+"angle" "270"
+"count" "2"
+}

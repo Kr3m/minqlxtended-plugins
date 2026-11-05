@@ -1,0 +1,45 @@
+{
+"classname" "holdable_quad"
+"origin" "512 512 100"
+"angle" "0"
+}
+{
+"classname" "holdable_haste"
+"origin" "100 100 100"
+"angle" "90"
+}
+{
+"classname" "holdable_invisibility"
+"origin" "900 900 100"
+"angle" "180"
+}
+{
+"classname" "holdable_invulnerability"
+"origin" "512 100 100"
+"angle" "270"
+}
+{
+"classname" "item_health_mega"
+"origin" "512 512 50"
+"angle" "0"
+}
+{
+"classname" "weapon_rg"
+"origin" "250 250 32"
+"angle" "45"
+}
+{
+"classname" "weapon_rl"
+"origin" "750 250 32"
+"angle" "135"
+}
+{
+"classname" "weapon_lg"
+"origin" "250 750 32"
+"angle" "225"
+}
+{
+"classname" "weapon_gl"
+"origin" "750 750 32"
+"angle" "315"
+}
