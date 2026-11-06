@@ -1,27 +1,28 @@
-# minqlx - A Quake Live server administrator bot.
+# minqlxtended - Extends Quake Live's dedicated server with extra functionality and scripting.
 # Copyright (C) 2015 Mino <mino@minomino.org>
+# Copyright (C) 2016-2026 Thomas Jones <me@thomasjones.id.au>
 
-# This file is part of minqlx.
+# This file is part of minqlxtended.
 
-# minqlx is free software: you can redistribute it and/or modify
+# minqlxtended is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-# minqlx is distributed in the hope that it will be useful,
+# minqlxtended is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 
 # You should have received a copy of the GNU General Public License
-# along with minqlx. If not, see <http://www.gnu.org/licenses/>.
+# along with minqlxtended. If not, see <http://www.gnu.org/licenses/>.
 
-import minqlx
+import minqlxtended
 import random
 import time
 import re
 
-from minqlx.database import Redis
+from minqlxtended.database import Redis
 
 _re_hahaha_yeah = re.compile(r"^haha(?:ha)?,? yeah?\W?$", flags=re.IGNORECASE)
 _re_haha_yeah_haha = re.compile(r"^haha(?:ha)?,? yeah?,? haha\W?$", flags=re.IGNORECASE)
@@ -63,18 +64,17 @@ _re_squish = re.compile(r"^squish\W?$", flags=re.IGNORECASE)
 _re_oh_god = re.compile(r"^oh god\W?$", flags=re.IGNORECASE)
 _re_snarl = re.compile(r"^snarl\W?$", flags=re.IGNORECASE)
 
-class fun(minqlx.Plugin):
+class fun(minqlxtended.Plugin):
     database = Redis
+
+    _qlx_funSoundDelay = minqlxtended.setting("qlx_funSoundDelay", 3)
 
     def __init__(self):
         super().__init__()
-        self.add_hook("chat", self.handle_chat)
-        self.add_command("cookies", self.cmd_cookies)
         self.last_sound = None
 
-        self.set_cvar_once("qlx_funSoundDelay", "3")
-
-    def handle_chat(self, player, msg, channel):
+    @minqlxtended.hook("chat")
+    def handle_chat(self, player, msg, channel, recipient):
         if channel != "chat":
             return
 
@@ -167,21 +167,25 @@ class fun(minqlx.Plugin):
     def play_sound(self, path):
         if not self.last_sound:
             pass
-        elif time.time() - self.last_sound < self.get_cvar("qlx_funSoundDelay", int):
+        elif time.time() - self.last_sound < self._qlx_funSoundDelay:
             return
 
         self.last_sound = time.time()
-        for p in self.players():
-            if self.db.get_flag(p, "essentials:sounds_enabled", default=True):
+        players = self.players()
+        enabled = self.db.get_flags(players, "essentials:sounds_enabled", default=True)
+        for p in players:
+            if enabled[p.steam_id]:
                 super().play_sound(path, p)
 
+    @minqlxtended.command("cookies")
     def cmd_cookies(self, player, msg, channel):
+        """ Give the server some cookies? """
         x = random.randint(0, 100)
         if not x:
-            channel.reply("^6♥ ^7Here you go, {}. I baked these just for you! ^6♥".format(player))
+            channel.reply(f"^6♥ ^7Here you go, {player.name}^7. I baked these just for you! ^6♥")
         elif x == 1:
-            channel.reply("What, you thought ^6you^7 would get cookies from me, {}? Hah, think again.".format(player))
+            channel.reply(f"What, you thought ^6you^7 would get cookies from me, {player.name}^7? Hah, think again.")
         elif x < 50:
-            channel.reply("For me? Thank you, {}!".format(player))
+            channel.reply(f"For me? Thank you, {player.name}^7!")
         else:
-            channel.reply("I'm out of cookies right now, {}. Sorry!".format(player))
+            channel.reply(f"I'm out of cookies right now, {player.name}^7. Sorry!")

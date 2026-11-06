@@ -1,78 +1,83 @@
-# Created by Thomas Jones on 01/01/2016 - thomas@tomtecsolutions.com
-# votestats.py - a minqlx plugin to show who votes yes or no in-game/vote results.
-# This plugin is released to everyone, for any purpose. It comes with no warranty, no guarantee it works, it's released AS IS.
-# You can modify everything, except for lines 1-4 and the !tomtec_versions code. They're there to indicate I whacked this together originally. Please make it better :D
+# minqlxtended - Extends Quake Live's dedicated server with extra functionality and scripting.
+# Copyright (C) 2016-2026 Thomas Jones <me@thomasjones.id.au>
 
-"""
-If you want to re-privatise votes, set the following cvar to 1: qlx_privatiseVotes
-"""
+# This file is part of minqlxtended.
 
-import minqlx
+# minqlxtended is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 
-class votestats(minqlx.Plugin):
+# minqlxtended is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with minqlxtended. If not, see <http://www.gnu.org/licenses/>.
+
+# votestats.py - a minqlxtended plugin to show who votes yes or no in-game/vote results.
+# If you want to re-privatise votes, set the following cvar to 1: qlx_privatiseVotes
+
+import minqlxtended
+
+VOTES_ENABLED_FLAG = "votestats:votes_enabled"
+
+class votestats(minqlxtended.Plugin):
+    _qlx_privatiseVotes = minqlxtended.setting("qlx_privatiseVotes", False)
+
     def __init__(self):
-        self.add_hook("vote_started", self.vote_started, priority=minqlx.PRI_LOWEST)
-        self.add_hook("vote", self.process_vote, priority=minqlx.PRI_LOWEST)
-        self.add_hook("vote_ended", self.handle_vote_ended, priority=minqlx.PRI_LOWEST)
-
-        self.add_command("votes", self.cmd_votes)
-        self.add_command("tomtec_versions", self.cmd_showversion)
-
-        self.set_cvar_once("qlx_privatiseVotes", "0")
-
-        self.plugin_version = "1.9"
+        super().__init__()
 
         self.has_voted = []
-    
-    def vote_started(self, player, vote, args):
-        self.has_voted = []
-        self.has_voted.append(player)
-        
+
+    @minqlxtended.command("votes")
     def cmd_votes(self, player, msg, channel):
-        flag = self.db.get_flag(player, "votestats:votes_enabled", default=True)
-        self.db.set_flag(player, "votestats:votes_enabled", not flag)
+        """ Prevents 'x voted y' messages from appearing for the calling player. Use again to re-enable these messages. """
+        flag = self.db.get_flag(player, VOTES_ENABLED_FLAG, default=True)
+        self.db.set_flag(player, VOTES_ENABLED_FLAG, not flag)
         if flag:
             word = "disabled"
         else:
             word = "enabled"
-        player.tell("Player votes have been ^4{}^7.".format(word))
-        return minqlx.RET_STOP_ALL
-    
+        player.tell(f"Player votes have been ^4{word}^7.")
+        return minqlxtended.Return.STOP_ALL
+
+    @minqlxtended.hook("vote", priority=minqlxtended.Priority.LOWEST)
     def process_vote(self, player, yes):
-        if self.get_cvar("qlx_privatiseVotes", bool):
+        if self._qlx_privatiseVotes:
             return
 
         if player in self.has_voted:
             return
 
-        if not self.get_cvar("g_allowSpecVote", bool):
-            if player.team == "spectator":
-                return
-        
         if yes:
             word = "^2yes"
         else:
             word = "^1no"
-        
-        for p in self.players():
-            if self.db.get_flag(p, "votestats:votes_enabled", default=True):
-                p.tell("{}^7 voted {}^7.".format(player.name, word))
-                
+
+        players = self.players()
+        enabled = self.db.get_flags(players, VOTES_ENABLED_FLAG, default=True)
+        recipients = [p for p in players if enabled[p.steam_id]]
+        self.tell_many(recipients, f"{player.name}^7 voted {word}^7.")
+
         self.has_voted.append(player)
 
+    @minqlxtended.hook("new_game")
+    def handle_new_game(self):
+        self.has_voted = []
+
+    @minqlxtended.hook("vote_ended", priority=minqlxtended.Priority.LOWEST)
     def handle_vote_ended(self, votes, vote, args, passed):
         self.has_voted = []
-        self.msg("Vote results: ^2{}^7 - ^1{}^7.".format(*votes))
-        
+        self.msg(f"Vote results: ^2{votes[0]}^7 - ^1{votes[1]}^7.")
+
         if passed:
-            if vote.lower() == "map":
+            if vote.lower().strip() == "map":
                 changingToMapAndMode = args.lower().split()
                 if len(changingToMapAndMode) > 1:
-                    theMsg = "The map is changing to ^4{}^7, with new game type ^4{}^7.".format(changingToMapAndMode[0], changingToMapAndMode[1])
+                    theMsg = f"The map is changing to ^6{changingToMapAndMode[0]}^7, with new factory ^6{changingToMapAndMode[1]}^7."
                 else:
-                    theMsg = "The map is changing to ^4{}^7.".format(changingToMapAndMode[0])
+                    theMsg = f"The map is changing to ^6{changingToMapAndMode[0]}^7."
 
                 self.msg(theMsg)
-    
-    def cmd_showversion(self, player, msg, channel):
-        channel.reply("^4votestats.py^7 - version {}, created by Thomas Jones on 01/01/2016.".format(self.plugin_version))

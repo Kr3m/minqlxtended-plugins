@@ -1,7 +1,22 @@
-# Created by Thomas Jones on 06/11/15 - thomas@tomtecsolutions.com
-# branding.py, a plugin for minqlx to brand your server.
-# This plugin is released to everyone, for any purpose. It comes with no warranty, no guarantee it works, it's released AS IS.
-# You can modify everything, except for lines 1-4 and the !tomtec_versions code. They're there to indicate I whacked this together originally. Please make it better :D
+# minqlxtended - Extends Quake Live's dedicated server with extra functionality and scripting.
+# Copyright (C) 2024-2026 Thomas Jones <me@thomasjones.id.au>
+
+# This file is part of minqlxtended.
+
+# minqlxtended is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# minqlxtended is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with minqlxtended. If not, see <http://www.gnu.org/licenses/>.
+
+# branding.py - a plugin for minqlxtended to brand your server.
 
 """
 Branding.py is a minqlx plugin that permits you to personalise your server with your own information.
@@ -15,61 +30,73 @@ Simply put the plugin in the 'minqlx-plugins' folder, !load the plugin, and set 
     qlx_loadedMessage                    - When the player gets to the menu after connecting, and clicks Join or Spectate, they'll get centre print from this cvar.
     qlx_countdownMessage                 - When the countdown begins, this text will appear mid-screen. (like the qlx_loadedMessage does)
     qlx_endOfGameMessage                 - When the game finishes, it'll put the text in this cvar in the text box on the left.
-    
+
+    qlx_brandingMapCredit                - Show the map's baked-in author credit before your brand fields. Default: 1
     qlx_brandingPrependMapName           - This cvar will put the map name before your qlx_serverBrandName.                     Default: 0
     qlx_brandingAppendGameType           - Will add the game type after your qlx_serverBrandName.                               Default: 0
     qlx_rainbowBrandName                 - Make the entire map name (qlx_serverBrandName) appear in rainbow colouring.          Default: 0
-    
+
 Once set, change maps, and you'll see the map loading screen is changed.
 """
 
-import minqlx
+import minqlxtended
 
-class branding(minqlx.Plugin):
+CS_MESSAGE = 3
+CS_AUTHOR = 678
+CS_AUTHOR2 = 679
+
+class branding(minqlxtended.Plugin):
+    _qlx_serverBrandName = minqlxtended.setting("qlx_serverBrandName", "")
+    _qlx_serverBrandTopField = minqlxtended.setting("qlx_serverBrandTopField", "")
+    _qlx_serverBrandBottomField = minqlxtended.setting("qlx_serverBrandBottomField", "")
+    _qlx_connectMessage = minqlxtended.setting("qlx_connectMessage", "")
+    _qlx_loadedMessage = minqlxtended.setting("qlx_loadedMessage", "")
+    _qlx_countdownMessage = minqlxtended.setting("qlx_countdownMessage", "")
+    _qlx_endOfGameMessage = minqlxtended.setting("qlx_endOfGameMessage", "")
+    _qlx_brandingMapCredit = minqlxtended.setting("qlx_brandingMapCredit", True)
+    _qlx_brandingPrependMapName = minqlxtended.setting("qlx_brandingPrependMapName", False)
+    _qlx_brandingAppendGameType = minqlxtended.setting("qlx_brandingAppendGameType", False)
+    _qlx_rainbowBrandName = minqlxtended.setting("qlx_rainbowBrandName", False)
+
     def __init__(self):
-        self.add_hook("new_game", self.brand_map)
-        self.add_hook("player_connect", self.player_connect)
-        self.add_hook("player_loaded", self.player_loaded)
-        self.add_hook("game_countdown", self.game_countdown)
-        self.add_hook("game_end", self.game_end)
-        
-        self.add_command("tomtec_versions", self.cmd_showversion)
+        super().__init__()
 
-        self.set_cvar_once("qlx_brandingPrependMapName", "0")
-        self.set_cvar_once("qlx_brandingAppendGameType", "0")
-        self.set_cvar_once("qlx_rainbowBrandName", "0")
-        
-        self.plugin_version = "2.1"
+        self.connected_players = set()
 
-        self.playerConnectedYetList = []
-        
-    def brand_map(self):
-        if self.get_cvar("qlx_serverBrandName") == None:
-            self.set_cvar("qlx_serverBrandName", self.game.map_title)
-            
-        if self.get_cvar("qlx_brandingPrependMapName", bool):
-            topBranding = self.game.map_title + " " + self.get_cvar("qlx_serverBrandName")
-        else:
-            topBranding = self.get_cvar("qlx_serverBrandName")
+    @minqlxtended.hook("new_game")
+    def handle_map(self):
+        game = self.game
+        if game is None:
+            return
 
-        if self.get_cvar("qlx_brandingAppendGameType", bool):
-            minqlx.set_configstring(3, topBranding + " " + self.game.type)
-        else:
-            minqlx.set_configstring(3, topBranding)
+        message = minqlxtended.configstring(CS_MESSAGE)
+        author = minqlxtended.configstring(CS_AUTHOR)
+        author2 = minqlxtended.configstring(CS_AUTHOR2)
 
-        if self.get_cvar("qlx_serverBrandTopField") != None:
-            cs = self.game.map_subtitle1
-            if cs:
-                cs += " - "
-            minqlx.set_configstring(678, cs + (self.get_cvar("qlx_serverBrandTopField")))
+        if self._qlx_serverBrandName and self._qlx_brandingPrependMapName and self._qlx_brandingAppendGameType:
+            message = f"{game.map_title} {self._qlx_serverBrandName} {game.type}"
+        elif self._qlx_serverBrandName and self._qlx_brandingPrependMapName:
+            message = f"{game.map_title} {self._qlx_serverBrandName}"
+        elif self._qlx_serverBrandName and self._qlx_brandingAppendGameType:
+            message = f"{self._qlx_serverBrandName} {game.type}"
+        elif self._qlx_serverBrandName:
+            message = self._qlx_serverBrandName
 
-        if self.get_cvar("qlx_serverBrandBottomField") != None:
-            cs = self.game.map_subtitle2
-            if cs:
-                cs += " - "
-            minqlx.set_configstring(679, cs + (self.get_cvar("qlx_serverBrandBottomField")))
+        # When qlx_brandingMapCredit is 1 (default), the map's baked-in
+        # author credit is prepended to your brand text (original
+        # behaviour). When 0, the map credit is dropped and only your
+        # brand text is shown.
+        show_map_credit = self._qlx_brandingMapCredit
 
-        if self.get_cvar("qlx_rainbowBrandName", bool):
+        if self._qlx_serverBrandTopField:
+            subtitle1 = game.map_subtitle1 if show_map_credit else ""
+            author = f"{(subtitle1 + ' - ') if subtitle1 else ''}{self._qlx_serverBrandTopField}"
+
+        if self._qlx_serverBrandBottomField:
+            subtitle2 = game.map_subtitle2 if show_map_credit else ""
+            author2 = f"{(subtitle2 + ' - ') if subtitle2 else ''}{self._qlx_serverBrandBottomField}"
+
+        if self._qlx_rainbowBrandName:
             # Thanks Mino for this bit!
             def rotating_colors():
                 i = 0
@@ -78,37 +105,39 @@ class branding(minqlx.Plugin):
                     i += 1
                     yield res
 
-            map_name = self.clean_text(minqlx.get_configstring(3))
             r = rotating_colors()
             res = ""
-            for i in range(len(map_name)):
-                res += "^{}{}".format(next(r), map_name[i])
+            for ch in self.clean_text(message):
+                res += f"^{next(r)}{ch}"
+            message = res
 
-            minqlx.set_configstring(3, res)
+        minqlxtended.set_configstring(CS_MESSAGE, message)
+        minqlxtended.set_configstring(CS_AUTHOR, author)
+        minqlxtended.set_configstring(CS_AUTHOR2, author2)
 
-    def player_connect(self, player):
-        if self.get_cvar("qlx_connectMessage") != None:
-            if player not in self.playerConnectedYetList:
-                self.playerConnectedYetList.append(player)
-                return "{}\n^7This server is running ^4branding.py^7. ^2http://github.com/tjone270/Quake-Live^7.\n".format(self.get_cvar("qlx_connectMessage"))
-        
-    def player_loaded(self, player):
-        if self.get_cvar("qlx_loadedMessage") != None:
-            self.center_print(self.get_cvar("qlx_loadedMessage"), player.id)
+    @minqlxtended.hook("player_connect")
+    def handle_player_connect(self, player, is_bot):
+        if (self._qlx_connectMessage) and (player.steam_id not in self.connected_players):
+            self.connected_players.add(player.steam_id)
+            return f"{self._qlx_connectMessage}\n^7This server is running ^4branding.py^7. ^2http://github.com/tjone270/Quake-Live^7.\n"
 
-        try:
-            self.playerConnectedYetList.remove(player)
-        except:
-            return
+    @minqlxtended.hook("player_loaded")
+    def handle_player_loaded(self, player):
+        if self._qlx_loadedMessage:
+            player.center_print(self._qlx_loadedMessage)
 
-    def game_countdown(self):
-        if self.get_cvar("qlx_countdownMessage") != None:
-            self.center_print(self.get_cvar("qlx_countdownMessage"))
+        self.connected_players.discard(player.steam_id)
 
-    def game_end(self, data):
-        if self.get_cvar("qlx_endOfGameMessage") != None:
-            self.msg(self.get_cvar("qlx_endOfGameMessage"))
+    @minqlxtended.hook("player_disconnect")
+    def handle_player_disconnect(self, player, reason):
+        self.connected_players.discard(player.steam_id)
 
-            
-    def cmd_showversion(self, player, msg, channel):
-        channel.reply("^4branding.py^7 - version {}, created by Thomas Jones on 06/11/2015.".format(self.plugin_version))
+    @minqlxtended.hook("game_countdown")
+    def handle_game_countdown(self):
+        if self._qlx_countdownMessage:
+            self.center_print(self._qlx_countdownMessage)
+
+    @minqlxtended.hook("game_end")
+    def handle_game_end(self, aborted):
+        if self._qlx_endOfGameMessage:
+            self.msg(self._qlx_endOfGameMessage)

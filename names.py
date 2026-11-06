@@ -1,104 +1,119 @@
-# minqlx - Extends Quake Live's dedicated server with extra functionality and scripting.
+# minqlxtended - Extends Quake Live's dedicated server with extra functionality and scripting.
 # Copyright (C) 2015 Mino <mino@minomino.org>
+# Copyright (C) 2016-2026 Thomas Jones <me@thomasjones.id.au>
 
-# This file is part of minqlx.
+# This file is part of minqlxtended.
 
-# minqlx is free software: you can redistribute it and/or modify
+# minqlxtended is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-# minqlx is distributed in the hope that it will be useful,
+# minqlxtended is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 
 # You should have received a copy of the GNU General Public License
-# along with minqlx. If not, see <http://www.gnu.org/licenses/>.
+# along with minqlxtended. If not, see <http://www.gnu.org/licenses/>.
 
-import minqlx
+import minqlxtended
 import re
 
 _re_remove_excessive_colors = re.compile(r"(?:\^.)+(\^.)")
 _name_key = "minqlx:players:{}:colored_name"
 
-class names(minqlx.Plugin):
-    def __init__(self):
-        self.add_hook("player_connect", self.handle_player_connect)
-        self.add_hook("player_loaded", self.handle_player_loaded)
-        self.add_hook("player_disconnect", self.handle_player_disconnect)
-        self.add_hook("userinfo", self.handle_userinfo)
-        self.add_command(("name", "setname"), self.cmd_name, usage="<name>", client_cmd_perm=0)
+class names(minqlxtended.Plugin):
+    _qlx_enforceSteamName = minqlxtended.setting("qlx_enforceSteamName", True)
+    _qlx_commandPrefix = minqlxtended.setting("qlx_commandPrefix", "!")
 
-        self.set_cvar_once("qlx_enforceSteamName", "1")
+    def __init__(self):
+        super().__init__()
 
         self.steam_names = {}
-        self.name_set = False
+        self.registered_names = {}
+        self.name_set = set()
 
-    def handle_player_connect(self, player):
+    @minqlxtended.hook("player_connect")
+    def handle_player_connect(self, player, is_bot):
         self.steam_names[player.steam_id] = player.clean_name
 
+    @minqlxtended.hook("player_loaded")
     def handle_player_loaded(self, player):
-        name_key = _name_key.format(player.steam_id)
-        if name_key in self.db:
-            db_name = self.db[name_key]
-            if not self.get_cvar("qlx_enforceSteamName", bool) or self.clean_text(db_name).lower() == player.clean_name.lower():
-                self.name_set = True
-                player.name = db_name
+        db_name = self.db.get(_name_key.format(player.steam_id))
+        self.registered_names[player.steam_id] = db_name
+        if db_name:
+            if not self._qlx_enforceSteamName or self.clean_text(db_name).lower() == player.clean_name.lower():
+                self._assign_name(player, db_name)
 
+    @minqlxtended.hook("player_disconnect")
     def handle_player_disconnect(self, player, reason):
-        if player.steam_id in self.steam_names:
-            del self.steam_names[player.steam_id]
+        self.steam_names.pop(player.steam_id, None)
+        self.registered_names.pop(player.steam_id, None)
+        self.name_set.discard(player.steam_id)
 
-    def handle_userinfo(self, player, changed):
+    @minqlxtended.hook("userinfo")
+    def handle_userinfo(self, player, changed, infostring):
         # Make sure we're not doing anything if our script set the name.
-        if self.name_set:
-            self.name_set = False
+        if player.steam_id in self.name_set:
+            self.name_set.discard(player.steam_id)
             return
 
         if "name" in changed:
-            name_key = _name_key.format(player.steam_id)
-            if name_key not in self.db:
-                self.steam_names[player.steam_id] = self.clean_text(changed["name"])
-            elif self.steam_names[player.steam_id] == self.clean_text(changed["name"]):
-                changed["name"] = self.db[name_key]
+            current_clean = self.clean_text(changed["name"])
+            registered = self.registered_names.get(player.steam_id)
+            if registered is None or player.steam_id not in self.steam_names:
+                self.steam_names[player.steam_id] = current_clean
+            elif self.steam_names[player.steam_id] == current_clean:
+                changed["name"] = registered
                 return changed
             else:
-                del self.db[name_key]
+                del self.db[_name_key.format(player.steam_id)]
+                self.registered_names[player.steam_id] = None
                 player.tell("Your registered name has been reset.")
 
+    @minqlxtended.command(("name", "setname"), client_cmd_perm=0, usage="<name>")
     def cmd_name(self, player, msg, channel):
+        """ Re-colours the player's name to the string specified, or clears custom colouring if nothing specified. """
         name_key = _name_key.format(player.steam_id)
 
         if len(msg) < 2:
             if name_key not in self.db:
-                return minqlx.RET_USAGE
+                return minqlxtended.Return.USAGE
             else:
                 del self.db[name_key]
+                self.registered_names[player.steam_id] = None
                 player.tell("Your registered name has been removed.")
-                return minqlx.RET_STOP_ALL
+                return minqlxtended.Return.STOP_ALL
 
         name = self.clean_excessive_colors(" ".join(msg[1:]))
         if len(name.encode()) > 36:
             player.tell("The name is too long. Consider using fewer colors or a shorter name.")
-            return minqlx.RET_STOP_ALL
-        elif self.clean_text(name).lower() != player.clean_name.lower() and self.get_cvar("qlx_enforceSteamName", bool):
+            return minqlxtended.Return.STOP_ALL
+        elif self.clean_text(name).lower() != player.clean_name.lower() and self._qlx_enforceSteamName:
             player.tell("The new name must match your current Steam name.")
-            return minqlx.RET_STOP_ALL
-        elif "\\" in name:
-            player.tell("The character '^6\\^7' cannot be used. Sorry for the inconvenience.")
-            return minqlx.RET_STOP_ALL
+            return minqlxtended.Return.STOP_ALL
+        elif any(c in name for c in "\\;\""):
+            player.tell("The characters '^6\\^7', '^6;^7' and '^6\"^7' cannot be used. Sorry for the inconvenience.")
+            return minqlxtended.Return.STOP_ALL
         elif not self.clean_text(name).strip():
             player.tell("Blank names cannot be used. Sorry for the inconvenience.")
-            return minqlx.RET_STOP_ALL
+            return minqlxtended.Return.STOP_ALL
 
-        self.name_set = True
         name = "^7" + name
-        player.name = name
+        self._assign_name(player, name)
         self.db[name_key] = name
-        player.tell("The name has been registered. To make me forget about it, a simple ^6{}name^7 will do it."
-            .format(self.get_cvar("qlx_commandPrefix")))
-        return minqlx.RET_STOP_ALL
+        self.registered_names[player.steam_id] = name
+        player.tell(f"The name has been registered. To make me forget about it, a simple ^6{self._qlx_commandPrefix}name^7 will do it.")
+        return minqlxtended.Return.STOP_ALL
+
+    def _assign_name(self, player, name):
+        """Set a player's name and flag the userinfo event it causes as ours."""
+        if player.cvars.get("name") == name:
+            return
+
+        self.name_set.add(player.steam_id)
+        player.name = name
 
     def clean_excessive_colors(self, name):
         """Removes excessive colors and only keeps the ones that matter."""

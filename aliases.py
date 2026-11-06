@@ -1,67 +1,137 @@
-# Created by Thomas Jones on 14/12/2015 - thomas@tomtecsolutions.com
-# aliases.py, a plugin for minqlx to show aliases from the redis database.
-# This plugin is released to everyone, for any purpose. It comes with no warranty, no guarantee it works, it's released AS IS.
-# You can modify everything, except for lines 1-4 and the !tomtec_versions code. They're there to indicate I whacked this together originally. Please make it better :D
+# minqlxtended - Extends Quake Live's dedicated server with extra functionality and scripting.
+# Copyright (C) 2024-2026 Thomas Jones <me@thomasjones.id.au>
 
-import minqlx
-import minqlx.database
+# This file is part of minqlxtended.
 
-class aliases(minqlx.Plugin):
-    database = minqlx.database.Redis
-    
-    def __init__(self):
-        self.add_command("alias", self.cmd_alias, usage="<id>")
-        self.add_command("clearaliases", self.cmd_clearaliases, 5)
-        self.add_command("tomtec_versions", self.cmd_showversion)
+# minqlxtended is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
 
-        self.plugin_version = "1.7"
+# minqlxtended is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
 
+# You should have received a copy of the GNU General Public License
+# along with minqlxtended. If not, see <http://www.gnu.org/licenses/>.
+
+# aliases.py - a plugin for minqlxtended to show player aliases
+
+import minqlxtended
+
+NOALIASES_FLAG_NAME = "noaliases"
+
+class aliases(minqlxtended.Plugin):
+    _linelimit = minqlxtended.setting("qlx_aliasLimitOutputLines", 15)
+
+    @minqlxtended.command("alias", usage="<id>")
     def cmd_alias(self, player, msg, channel):
+        """Provides a list of aliases the server is aware of for the player ID/Steam ID provided."""
         if len(msg) < 2:
-            return minqlx.RET_USAGE
+            return minqlxtended.Return.USAGE
 
-        try:
-            ident = int(msg[1])
-            target_player = None
-            if 0 <= ident < 64:
-                steam_id = self.player(int(msg[1])).steam_id
-                player_name = self.player(int(msg[1])).name
-                ip_address = self.player(int(msg[1])).ip
-            else:
-                player_name = ident
-                steam_id = ident
-                key = "minqlx:players:{}:ips".format(steam_id)
-                iplist = list(self.db.smembers(key))
-                ip_address = iplist[-1]
-        except ValueError:
-            channel.reply("Invalid ID. Use either a client ID or a SteamID64.")
+        resolved = self.resolve_identifier(msg[1], channel)
+        if resolved is None:
             return
-        except minqlx.NonexistentPlayerError:
-            channel.reply("Invalid client ID. Use either a client ID or a SteamID64.")
+        steam_id, player_name, target_player = resolved
+
+        if target_player is not None and target_player.is_bot:
+            channel.reply("Bots do not have aliases!")
             return
 
-        key = "minqlx:ips:{}".format(ip_address)
-        steamid_iplist = list(self.db.smembers(key))
+        self._lookup_aliases(player.name, msg[0], steam_id, player_name, channel)
+        return
 
-        namelist = list()
-        
-        for steam_id in steamid_iplist:
-            key = "minqlx:players:{}".format(steam_id)
-            namelist = namelist + (list(self.db.lrange(key, 0, -1)))
-            
-        channel.reply("{}^7 has played on this server under the following names:".format(player_name))
-        channel.reply(" ^4*^7  {}".format("   \n ^4*^7  ".join(namelist)))
+    @minqlxtended.thread
+    def _lookup_aliases(self, caller_name, command, steam_id, player_name, channel):
+        player_iplist = list(self.db.smembers(f"minqlx:players:{steam_id}:ips"))
 
-        channel.reply("{}^7 has played on this server under the following Steam64 IDs:".format(player_name))
-        channel.reply(" ^4*^7  {}".format("   \n ^4*^7  ".join(steamid_iplist)))
+        lineused = 1
+        response = f"{player_name}^7's aliases:\n"
 
-        
+        if self.db.get_flag(steam_id, NOALIASES_FLAG_NAME):
+            self.logger.info(f"{caller_name} ran {command} on {player_name} who has the '{NOALIASES_FLAG_NAME}' flag set.")
+            name = self.db.get(f"minqlx:players:{steam_id}:current_name")
+            if name:
+                response += f" ^6•^7 {steam_id}:\n    ^6•^7 {self.clean_text(name)}"
+            channel.reply(response)
+            return
+
+        data = dict()
+        steamids = list()
+
+        for ip_address in player_iplist:
+            steamids += list(self.db.smembers(f"minqlx:ips:{ip_address}"))
+
+        steamids = self.dedupe(steamids)
+
+        for steamid in steamids:
+            data[steamid] = list(self.db.lrange(f"minqlx:players:{steamid}", 0, -1))
+
+        for sid, names in data.items():
+            if lineused == self._linelimit:
+                break
+            used_names = list()
+            response += f" ^6•^7 {sid}:\n"
+            for name in names:
+                if name not in used_names:
+                    if lineused == self._linelimit:
+                        response += f"^1Remaining aliases truncated (line limit set to {self._linelimit})^7\n"
+                        break
+                    response += f"    ^6•^7 {self.clean_text(name)}\n"
+                    lineused += 1
+                    used_names.append(name)
+
+        channel.reply(response)
+
+    @minqlxtended.command("setnoaliases", permission=4, client_cmd_perm=4, usage="<id>")
+    def cmd_setnoaliases(self, player, msg, channel):
+        """Set/unset the 'noaliases' flag for players, preventing that player's aliases from being listed by the !alias command."""
+        if len(msg) < 2:
+            return minqlxtended.Return.USAGE
+
+        resolved = self.resolve_identifier(msg[1], channel)
+        if resolved is None:
+            return
+        ident, _name, target_player = resolved
+
+        if target_player:
+            name = target_player.clean_name
+        else:
+            name = ident
+
+        flag = not self.db.get_flag(ident, NOALIASES_FLAG_NAME)
+        self.db.set_flag(ident, NOALIASES_FLAG_NAME, flag)
+
+        word = "now has" if flag else "no longer has"
+        channel.reply(f"Player ^6{name}^7 {word} the 'no aliases' flag.")
+
+    @minqlxtended.command("clearaliases", permission=5)
     def cmd_clearaliases(self, player, msg, channel):
-        # this function came from namesfix.py by Mino
-        players = self.db.smembers("minqlx:players")
-        for p in players:
-            del self.db["minqlx:players:{}".format(p)]
-        channel.reply("All aliases for all players ({} players in total) were cleared.".format(len(players)))
+        """Clears all alias records from the server database."""
+        if player.steam_id != minqlxtended.owner():
+            player.tell("You must be the owner of the server to execute this command.")
+            return
 
-    def cmd_showversion(self, player, msg, channel):
-        channel.reply("^4aliases.py^7 - version {}, created by Thomas Jones on 14/12/2015.".format(self.plugin_version))
+        channel.reply("Clearing all aliases in the background...")
+        self._clear_aliases(channel)
+
+    @minqlxtended.thread
+    def _clear_aliases(self, channel):
+        players = self.db.smembers("minqlx:players")
+        ips = self.db.smembers("minqlx:ips")
+
+        keys = [f"minqlx:players:{p}" for p in players]
+        keys += [f"minqlx:players:{p}:current_name" for p in players]
+        keys += [f"minqlx:players:{p}:ips" for p in players]
+        keys += [f"minqlx:ips:{ip}" for ip in ips]
+        keys.append("minqlx:ips")
+
+        for start in range(0, len(keys), 500):
+            self.db.delete(*keys[start:start + 500])
+
+        channel.reply(f"All aliases for all players ({len(players)} players in total) were cleared.")
+
+    def dedupe(self, lst):
+        return list(dict.fromkeys(lst))
