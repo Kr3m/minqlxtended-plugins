@@ -44,7 +44,8 @@ class discord_ql_mover(minqlxtended.Plugin):
 
         self._last_move_ts = 0.0
         self._last_auto_teams_move_ts = 0.0
-        self.active_match_users = set()
+        self.moved_users_by_bot = set()
+        self.active_match_users = self.moved_users_by_bot
 
     # ---------- Commands ----------
     def handle_game_countdown(self):
@@ -82,22 +83,27 @@ class discord_ql_mover(minqlxtended.Plugin):
             return
 
         teams = self.teams()
+        spectator_players = [(player.clean_name, str(player.steam_id)) for player in teams.get("spectator", [])]
         team_snapshot = (
             [(player.clean_name, str(player.steam_id)) for player in teams.get("blue", [])],
             [(player.clean_name, str(player.steam_id)) for player in teams.get("red", [])],
+            spectator_players,
         )
-        self._move_default_after_game_end(team_snapshot)
+        forced_default_discord_ids = self._resolve_forced_spectator_discord_ids(spectator_players)
+        self._move_default_after_game_end(team_snapshot, forced_default_discord_ids)
 
     @minqlxtended.delay(2)
     @minqlxtended.thread
-    def _move_default_after_game_end(self, team_snapshot):
+    def _move_default_after_game_end(self, team_snapshot, forced_default_discord_ids):
         config_error = self._validate_runtime_config()
         if config_error is not None:
             self.msg("^1[DMover]^7 Automatic map-end move skipped: {}".format(config_error))
             return
 
-        self.msg("^2[DMover]^7 Map ended; returning tracked match players to the default voice channel.")
-        self._execute_move("default", minqlxtended.CHAT_CHANNEL, team_snapshot)
+        self.msg("^2[DMover]^7 Map ended; returning tracked match players (and spectators in red/blue voice) to the default voice channel.")
+        self._execute_move(
+            "default", minqlxtended.CHAT_CHANNEL, team_snapshot, force_move_discord_ids=forced_default_discord_ids
+        )
 
     def cmd_move(self, player, msg, channel):
         if not self._require_permission(player, channel):
@@ -359,7 +365,7 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     # ---------- Move flow ----------
     @minqlxtended.thread
-    def _execute_move(self, action, channel, team_snapshot=None):
+    def _execute_move(self, action, channel, team_snapshot=None, force_move_discord_ids=None):
         token = self.get_cvar("qlx_dmoverDiscordBotToken")
         guild_id = self.get_cvar("qlx_dmoverDiscordGuildId")
         default_channel = self.get_cvar("qlx_dmoverDefaultChannelId")
@@ -367,12 +373,20 @@ class discord_ql_mover(minqlxtended.Plugin):
         blue_channel = self.get_cvar("qlx_dmoverBlueChannelId")
         dry_run = self.get_cvar("qlx_dmoverDryRun", bool)
 
+        if force_move_discord_ids is None:
+            force_move_discord_ids = set()
+
         if team_snapshot is None:
             teams = self.teams()
             blue_players = [(player.clean_name, str(player.steam_id)) for player in teams.get("blue", [])]
             red_players = [(player.clean_name, str(player.steam_id)) for player in teams.get("red", [])]
+            spectator_players = []
         else:
-            blue_players, red_players = team_snapshot
+            if len(team_snapshot) == 3:
+                blue_players, red_players, spectator_players = team_snapshot
+            else:
+                blue_players, red_players = team_snapshot
+                spectator_players = []
 
         if action == "teams":
             self.active_match_users.clear()
@@ -387,15 +401,25 @@ class discord_ql_mover(minqlxtended.Plugin):
             target_channel = blue_channel if action == "teams" else default_channel
             self._move_player(
                 action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
-                blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel
+                blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
+                force_move_discord_ids
             )
 
         for player_name, steam_id in red_players:
             target_channel = red_channel if action == "teams" else default_channel
             self._move_player(
                 action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
-                blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel
+                blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
+                force_move_discord_ids
             )
+
+        if action == "default":
+            for player_name, steam_id in spectator_players:
+                self._move_player(
+                    action, player_name, steam_id, guild_id, token, default_channel, default_channel, red_channel,
+                    blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
+                    force_move_discord_ids
+                )
 
         self._report_move_result(
             action, channel, moved, missing, failed, skipped_untracked, skipped_wrong_channel, dry_run
@@ -405,14 +429,16 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     def _move_player(
         self, action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
-        blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel
+        blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
+        force_move_discord_ids
     ):
         discord_id = self._get_discord_by_steam(steam_id)
         if discord_id is None:
             missing.append((player_name, steam_id))
             return
 
-        if action == "default" and discord_id not in self.active_match_users:
+        force_move = action == "default" and discord_id in force_move_discord_ids
+        if action == "default" and discord_id not in self.active_match_users and not force_move:
             skipped_untracked.append((player_name, steam_id, discord_id))
             return
 
@@ -442,6 +468,14 @@ class discord_ql_mover(minqlxtended.Plugin):
                 self.active_match_users.discard(discord_id)
         else:
             failed.append((player_name, steam_id, discord_id, status, body))
+
+    def _resolve_forced_spectator_discord_ids(self, spectator_players):
+        forced_ids = set()
+        for _, steam_id in spectator_players:
+            discord_id = self._get_discord_by_steam(steam_id)
+            if discord_id is not None:
+                forced_ids.add(discord_id)
+        return forced_ids
 
     def _discord_get_member_voice_channel(self, guild_id, discord_id, token):
         url = "https://discord.com/api/v10/guilds/{}/voice-states/{}".format(guild_id, discord_id)
