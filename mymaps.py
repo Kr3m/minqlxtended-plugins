@@ -8,11 +8,13 @@ Overrides !map <mapname> [factory] to support map-pool-aware factory selection w
 Enabled behavior (!map <mapname> [factory]):
   1) If [factory] is explicitly provided, use it.
   2) If [factory] is omitted and map is listed in sv_mapPoolFile/sv_mappoolfile, use pool factory.
-  3) If [factory] is omitted and map is not listed in pool, use currently loaded factory.
-  4) If no factory can be resolved, change map without factory (engine/default behavior).
+  3) For an unlisted map, use nonblank qlx_defaultFactory.
+  4) Otherwise use the currently running factory.
+  5) If no factory can be resolved, log an error and notify the caller without loading.
 
 Disabled behavior:
-  Reverts to stock !map behavior from essentials:
+  Faithfully reimplements stock !map behavior from essentials, rather than delegating
+  to a potentially customized handler. No pool/default-factory lookup is performed:
     self.change_map(msg[1], msg[2] if len(msg) > 2 else None)
 
 Install / load notes
@@ -21,74 +23,112 @@ Install / load notes
   That gives it precedence over lower-priority handlers, including essentials.
 - Keep essentials loaded for all other commands/features.
 - If another plugin also registers !map at PRI_HIGHEST, load order between those two will matter.
+  Unload that competing override (including a separate map.py), or load mymaps first.
+- Supports minqlx and minqlxtended; add_command is the command-registration API,
+  not console_command (which executes an engine command).
+- Relative pool paths resolve under fs_homepath/baseq3, then fs_basepath/baseq3.
+  Absolute pool paths are supported. Parsed pools are cached by path and stat fingerprint;
+  edits are picked up on the next command, without reloading the plugin.
+- Factory IDs are passed through to QL for validation, including qlx_defaultFactory.
 
 Custom Cvars
 ------------
 - qlx_mymaps_enable (default: "1")
     1/on/true/yes  -> enabled (map-pool-aware resolution)
     0/off/false/no -> disabled (stock !map behavior)
+- qlx_defaultFactory (default: "", string)
+    Factory for unlisted maps when no explicit factory is supplied. Empty/blank means
+    use the currently running factory. Both cvars are read live at command execution.
 """
 
 import os
 
-import minqlxtended
+try:
+    import minqlxtended as minqlx
+except ModuleNotFoundError as exc:
+    if exc.name != "minqlxtended":
+        raise
+    import minqlx
+
+    HIGHEST = minqlx.PRI_HIGHEST
+    STOP_ALL = minqlx.RET_STOP_ALL
+    USAGE = minqlx.RET_USAGE
+else:
+    HIGHEST = minqlx.Priority.HIGHEST
+    STOP_ALL = minqlx.Return.STOP_ALL
+    USAGE = minqlx.Return.USAGE
 
 
-class mymaps(minqlxtended.Plugin):
+class mymaps(minqlx.Plugin):
     def __init__(self):
         super().__init__()
 
-        # Primary feature toggle (default enabled).
         self.set_cvar_once("qlx_mymaps_enable", "1")
+        self.set_cvar_once("qlx_defaultFactory", "")
 
         # Simple in-memory cache for parsed map pool, invalidated by file mtime/path changes.
         self._cached_pool_path = None
-        self._cached_pool_mtime = None
+        self._cached_pool_stamp = None
         self._cached_pool_data = None
 
         self.add_command(
             ("map", "changemap"),
             self.cmd_map,
             permission=2,  # matches essentials !map permission
-            priority=minqlxtended.Priority.HIGHEST,
+            priority=HIGHEST,
             usage="<mapname> [factory]",
         )
 
     def cmd_map(self, player, msg, channel):
         if len(msg) < 2:
-            return minqlxtended.Return.USAGE
+            return USAGE
 
         map_name = msg[1].strip()
         if not map_name:
-            return minqlxtended.Return.USAGE
+            return USAGE
 
         explicit_factory = msg[2].strip() if len(msg) > 2 and msg[2].strip() else None
 
         # Toggle branch:
-        # - disabled => revert to stock !map behavior (delegate to essentials if present)
+        # - disabled => reimplement stock !map without pool/default-factory lookup
         # - enabled  => apply enhanced map-pool-aware factory resolution
         if not self._feature_enabled():
-            return self._default_map_behavior(player, msg, channel, map_name, explicit_factory)
+            return self._default_map_behavior(player, msg, channel)
 
         resolved_factory = self._resolve_factory(map_name, explicit_factory)
-        self.change_map(map_name, resolved_factory)
+        if resolved_factory is None:
+            self.logger.error(
+                "Cannot load map '%s': qlx_defaultFactory is empty and the current factory is unavailable.",
+                map_name,
+            )
+            channel.reply(
+                "^1Cannot load map '{}': no factory is available. "
+                "Specify a factory explicitly or set qlx_defaultFactory.".format(map_name)
+            )
+            return STOP_ALL
+
+        return self._load_map(map_name, resolved_factory, channel)
+
+    def _load_map(self, map_name, factory, channel):
+        try:
+            self.change_map(map_name, factory)
+        except (ValueError, RuntimeError, minqlx.NonexistentGameError):
+            self.logger.exception("Failed to load map '%s' with factory '%s'.", map_name, factory)
+            channel.reply("^1Failed to load map '{}'. See the server log for details.".format(map_name))
 
         # Prevent lower-priority !map handlers from running.
-        return minqlxtended.Return.STOP_ALL
+        return STOP_ALL
+
+    def _read_cvar(self, name, default=""):
+        try:
+            value = self.get_cvar(name)
+        except Exception as exc:
+            self.logger.warning("Failed reading %s (%s). Using default %r.", name, exc, default)
+            return default
+        return default if value is None else value
 
     def _feature_enabled(self):
-        try:
-            raw_value = self.get_cvar("qlx_mymaps_enable")
-        except Exception as exc:
-            self.logger.warning(
-                "Failed reading qlx_mymaps_enable (%s). Falling back to default enabled state.",
-                exc,
-            )
-            return True
-
-        if raw_value is None:
-            return True  # default if unset/missing
-
+        raw_value = self._read_cvar("qlx_mymaps_enable", "1")
         normalized = raw_value.strip().lower()
         if normalized in {"1", "true", "on", "yes"}:
             return True
@@ -102,52 +142,50 @@ class mymaps(minqlxtended.Plugin):
         )
         return True
 
-    def _default_map_behavior(self, player, msg, channel, map_name, explicit_factory):
-        # Delegate to stock essentials handler when available to preserve exact behavior.
-        essentials_plugin = self.plugins.get("essentials")
-        if essentials_plugin and hasattr(essentials_plugin, "cmd_map"):
-            result = essentials_plugin.cmd_map(player, msg, channel)
-            if result == minqlxtended.Return.USAGE:
-                return minqlxtended.Return.USAGE
-            return minqlxtended.Return.STOP_ALL
+    def _get_default_factory_cvar(self):
+        return self._read_cvar("qlx_defaultFactory").strip()
 
-        # Fallback: faithful reimplementation of stock essentials cmd_map semantics.
-        self.change_map(map_name, explicit_factory)
-        return minqlxtended.Return.STOP_ALL
+    def _default_map_behavior(self, player, msg, channel):
+        return self._load_map(msg[1], msg[2] if len(msg) > 2 else None, channel)
 
     def _resolve_factory(self, map_name, explicit_factory):
         # Factory resolution decision tree (enabled mode):
         # 1) explicit factory argument wins
         # 2) else map-pool factory for listed maps
-        # 3) else currently loaded factory for unlisted maps
+        # 3) else nonblank qlx_defaultFactory
+        # 4) else currently running factory
+        # 5) else fail without issuing a map command
         if explicit_factory:
-            return explicit_factory
+            return self._resolved_factory(map_name, explicit_factory, "explicit")
 
         pool = self._parse_map_pool()
         if pool:
             pool_factory = pool.get(map_name.lower())
             if pool_factory:
-                return pool_factory
+                return self._resolved_factory(map_name, pool_factory, "pool")
+
+        default_factory = self._get_default_factory_cvar()
+        if default_factory:
+            return self._resolved_factory(map_name, default_factory, "qlx_defaultFactory")
 
         current_factory = self._current_factory()
         if current_factory:
-            return current_factory
+            return self._resolved_factory(map_name, current_factory, "current factory")
 
-        self.logger.warning(
-            "No factory resolved for map '%s' (not in pool or pool unavailable, and no current factory). "
-            "Proceeding without explicit factory.",
-            map_name,
-        )
         return None
 
-    def _current_factory(self):
-        game = self.game
-        if not game:
-            return None
+    def _resolved_factory(self, map_name, factory, rule):
+        self.logger.debug("Map '%s': resolved factory '%s' using %s.", map_name, factory, rule)
+        return factory
 
+    def _current_factory(self):
         try:
+            game = self.game
+            if game is None:
+                return None
             factory = game.factory
-        except minqlxtended.NonexistentGameError:
+        except (minqlx.NonexistentGameError, KeyError) as exc:
+            self.logger.warning("Could not determine the current factory: %s", exc)
             return None
 
         return factory.strip() if factory else None
@@ -159,7 +197,8 @@ class mymaps(minqlxtended.Plugin):
             return None
 
         try:
-            pool_mtime = os.path.getmtime(pool_path)
+            stat = os.stat(pool_path)
+            pool_stamp = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
         except OSError as exc:
             self.logger.warning("Could not stat map pool file '%s': %s", pool_path, exc)
             self._clear_pool_cache()
@@ -168,21 +207,21 @@ class mymaps(minqlxtended.Plugin):
         if (
             self._cached_pool_data is not None
             and self._cached_pool_path == pool_path
-            and self._cached_pool_mtime == pool_mtime
+            and self._cached_pool_stamp == pool_stamp
         ):
             return self._cached_pool_data
 
         parsed = {}
         try:
-            with open(pool_path, "r") as pool_file:
+            with open(pool_path, "r", encoding="utf-8") as pool_file:
                 for line_number, raw_line in enumerate(pool_file, start=1):
                     line = raw_line.strip()
                     if not line or line.startswith("#"):
                         continue
 
-                    if "|" not in line:
+                    if line.count("|") != 1:
                         self.logger.warning(
-                            "Skipping malformed map pool line %d in '%s': missing '|'.",
+                            "Skipping malformed map pool line %d in '%s': expected one '|'.",
                             line_number,
                             pool_path,
                         )
@@ -210,22 +249,18 @@ class mymaps(minqlxtended.Plugin):
                         continue
 
                     parsed[key] = factory
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             self.logger.warning("Could not read map pool file '%s': %s", pool_path, exc)
             self._clear_pool_cache()
             return None
 
         self._cached_pool_path = pool_path
-        self._cached_pool_mtime = pool_mtime
+        self._cached_pool_stamp = pool_stamp
         self._cached_pool_data = parsed
         return parsed
 
     def _resolve_map_pool_path(self):
-        map_pool_cvar = (
-            self.get_cvar("sv_mapPoolFile")
-            or self.get_cvar("sv_mappoolfile")
-            or ""
-        ).strip()
+        map_pool_cvar = self._read_cvar("sv_mapPoolFile").strip()
         if not map_pool_cvar:
             self.logger.warning("sv_mapPoolFile/sv_mappoolfile is not set.")
             return None
@@ -237,15 +272,13 @@ class mymaps(minqlxtended.Plugin):
             return None
 
         candidates = []
-        fs_homepath = self.get_cvar("fs_homepath", str)
-        fs_basepath = self.get_cvar("fs_basepath", str)
+        fs_homepath = self._read_cvar("fs_homepath")
+        fs_basepath = self._read_cvar("fs_basepath")
 
         if fs_homepath:
             candidates.append(os.path.join(fs_homepath, "baseq3", map_pool_cvar))
-            candidates.append(os.path.join(fs_homepath, map_pool_cvar))
         if fs_basepath:
             candidates.append(os.path.join(fs_basepath, "baseq3", map_pool_cvar))
-            candidates.append(os.path.join(fs_basepath, map_pool_cvar))
 
         seen = set()
         for candidate in candidates:
@@ -264,5 +297,5 @@ class mymaps(minqlxtended.Plugin):
 
     def _clear_pool_cache(self):
         self._cached_pool_path = None
-        self._cached_pool_mtime = None
+        self._cached_pool_stamp = None
         self._cached_pool_data = None
