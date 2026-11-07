@@ -381,26 +381,31 @@ class discord_ql_mover(minqlxtended.Plugin):
         missing = []
         failed = []
         skipped_untracked = []
+        skipped_wrong_channel = []
 
         for player_name, steam_id in blue_players:
             target_channel = blue_channel if action == "teams" else default_channel
             self._move_player(
-                action, player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed,
-                skipped_untracked
+                action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
+                blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel
             )
 
         for player_name, steam_id in red_players:
             target_channel = red_channel if action == "teams" else default_channel
             self._move_player(
-                action, player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed,
-                skipped_untracked
+                action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
+                blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel
             )
 
-        self._report_move_result(action, channel, moved, missing, failed, skipped_untracked, dry_run)
+        self._report_move_result(
+            action, channel, moved, missing, failed, skipped_untracked, skipped_wrong_channel, dry_run
+        )
+        if action == "default":
+            self.active_match_users.clear()
 
     def _move_player(
-        self, action, player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed,
-        skipped_untracked
+        self, action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
+        blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel
     ):
         discord_id = self._get_discord_by_steam(steam_id)
         if discord_id is None:
@@ -409,6 +414,19 @@ class discord_ql_mover(minqlxtended.Plugin):
 
         if action == "default" and discord_id not in self.active_match_users:
             skipped_untracked.append((player_name, steam_id, discord_id))
+            return
+
+        ok, status, source_channel, body = self._discord_get_member_voice_channel(guild_id, discord_id, token)
+        if not ok:
+            failed.append((player_name, steam_id, discord_id, status, body))
+            return
+
+        if action == "teams":
+            if source_channel != str(default_channel):
+                skipped_wrong_channel.append((player_name, steam_id, discord_id, source_channel, "teams"))
+                return
+        elif source_channel not in (str(red_channel), str(blue_channel)):
+            skipped_wrong_channel.append((player_name, steam_id, discord_id, source_channel, "default"))
             return
 
         if dry_run:
@@ -424,6 +442,58 @@ class discord_ql_mover(minqlxtended.Plugin):
                 self.active_match_users.discard(discord_id)
         else:
             failed.append((player_name, steam_id, discord_id, status, body))
+
+    def _discord_get_member_voice_channel(self, guild_id, discord_id, token):
+        url = "https://discord.com/api/v10/guilds/{}/voice-states/{}".format(guild_id, discord_id)
+        timeout_seconds = self.get_cvar("qlx_dmoverRequestTimeoutSeconds", float)
+
+        ok, status, body = self._discord_get_json(url, token, timeout_seconds)
+        if not ok:
+            if status == 404:
+                return True, status, None, ""
+            return False, status, None, body
+
+        channel_id = body.get("channel_id")
+        if channel_id is None:
+            return True, status, None, ""
+        return True, status, str(channel_id), ""
+
+    def _discord_get_json(self, url, token, timeout_seconds):
+        headers = {
+            "Authorization": "Bot {}".format(token),
+            "User-Agent": "discord-ql-mover/1.0",
+        }
+
+        request = urllib.request.Request(url=url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                status = getattr(response, "status", 200)
+                payload = json.load(response)
+                return True, int(status), payload
+        except urllib.error.HTTPError as err:
+            status = int(err.code)
+            body = err.read().decode("utf-8", errors="replace")
+            if status == 429:
+                retry_seconds = self._parse_retry_after(body)
+                if retry_seconds is not None and retry_seconds <= 10:
+                    time.sleep(retry_seconds)
+                    try:
+                        with urllib.request.urlopen(request, timeout=timeout_seconds) as retry_response:
+                            retry_status = getattr(retry_response, "status", 200)
+                            retry_payload = json.load(retry_response)
+                            return True, int(retry_status), retry_payload
+                    except urllib.error.HTTPError as retry_err:
+                        retry_body = retry_err.read().decode("utf-8", errors="replace")
+                        return False, int(retry_err.code), retry_body
+                    except urllib.error.URLError as retry_err:
+                        return False, -1, str(retry_err.reason)
+                    except ValueError:
+                        return False, -1, "Invalid Discord JSON response."
+            return False, status, body
+        except urllib.error.URLError as err:
+            return False, -1, str(err.reason)
+        except ValueError:
+            return False, -1, "Invalid Discord JSON response."
 
     def _discord_move_member(self, guild_id, discord_id, channel_id, token):
         payload = json.dumps({"channel_id": str(channel_id)}).encode("utf-8")
@@ -483,11 +553,17 @@ class discord_ql_mover(minqlxtended.Plugin):
         return value
 
     @minqlxtended.next_frame
-    def _report_move_result(self, action, channel, moved, missing, failed, skipped_untracked, dry_run):
+    def _report_move_result(
+        self, action, channel, moved, missing, failed, skipped_untracked, skipped_wrong_channel, dry_run
+    ):
         mode = "DRY-RUN " if dry_run else ""
         channel.reply(
-            "^2[DMover]^7 {}{} completed. moved:^6{}^7 missing-link:^6{}^7 skipped-untracked:^6{}^7 failed:^6{}^7"
-            .format(mode, action, len(moved), len(missing), len(skipped_untracked), len(failed))
+            "^2[DMover]^7 {}{} completed. moved:^6{}^7 missing-link:^6{}^7 skipped-untracked:^6{}^7 "
+            "skipped-wrong-channel:^6{}^7 failed:^6{}^7"
+            .format(
+                mode, action, len(moved), len(missing), len(skipped_untracked), len(skipped_wrong_channel),
+                len(failed)
+            )
         )
 
         if missing:
@@ -499,6 +575,12 @@ class discord_ql_mover(minqlxtended.Plugin):
                 ["{}({})".format(name, steam_id) for name, steam_id, _ in skipped_untracked[:8]]
             )
             channel.reply("^3[DMover]^7 Skipped untracked players: {}".format(skipped_names))
+
+        if skipped_wrong_channel:
+            skipped_names = ", ".join(
+                ["{}({})".format(name, steam_id) for name, steam_id, _, _, _ in skipped_wrong_channel[:8]]
+            )
+            channel.reply("^3[DMover]^7 Skipped due to source channel rules: {}".format(skipped_names))
 
         if failed:
             first = failed[0]
