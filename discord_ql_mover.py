@@ -44,6 +44,7 @@ class discord_ql_mover(minqlxtended.Plugin):
 
         self._last_move_ts = 0.0
         self._last_auto_teams_move_ts = 0.0
+        self.active_match_users = set()
 
     # ---------- Commands ----------
     def handle_game_countdown(self):
@@ -95,7 +96,7 @@ class discord_ql_mover(minqlxtended.Plugin):
             self.msg("^1[DMover]^7 Automatic map-end move skipped: {}".format(config_error))
             return
 
-        self.msg("^2[DMover]^7 Map ended; returning mapped red/blue players to the default voice channel.")
+        self.msg("^2[DMover]^7 Map ended; returning tracked match players to the default voice channel.")
         self._execute_move("default", minqlxtended.CHAT_CHANNEL, team_snapshot)
 
     def cmd_move(self, player, msg, channel):
@@ -373,24 +374,41 @@ class discord_ql_mover(minqlxtended.Plugin):
         else:
             blue_players, red_players = team_snapshot
 
+        if action == "teams":
+            self.active_match_users.clear()
+
         moved = []
         missing = []
         failed = []
+        skipped_untracked = []
 
         for player_name, steam_id in blue_players:
             target_channel = blue_channel if action == "teams" else default_channel
-            self._move_player(player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed)
+            self._move_player(
+                action, player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed,
+                skipped_untracked
+            )
 
         for player_name, steam_id in red_players:
             target_channel = red_channel if action == "teams" else default_channel
-            self._move_player(player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed)
+            self._move_player(
+                action, player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed,
+                skipped_untracked
+            )
 
-        self._report_move_result(action, channel, moved, missing, failed, dry_run)
+        self._report_move_result(action, channel, moved, missing, failed, skipped_untracked, dry_run)
 
-    def _move_player(self, player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed):
+    def _move_player(
+        self, action, player_name, steam_id, guild_id, token, target_channel, dry_run, moved, missing, failed,
+        skipped_untracked
+    ):
         discord_id = self._get_discord_by_steam(steam_id)
         if discord_id is None:
             missing.append((player_name, steam_id))
+            return
+
+        if action == "default" and discord_id not in self.active_match_users:
+            skipped_untracked.append((player_name, steam_id, discord_id))
             return
 
         if dry_run:
@@ -400,6 +418,10 @@ class discord_ql_mover(minqlxtended.Plugin):
         ok, status, body = self._discord_move_member(guild_id, discord_id, target_channel, token)
         if ok:
             moved.append((player_name, steam_id, discord_id, str(status)))
+            if action == "teams":
+                self.active_match_users.add(discord_id)
+            elif action == "default":
+                self.active_match_users.discard(discord_id)
         else:
             failed.append((player_name, steam_id, discord_id, status, body))
 
@@ -461,14 +483,22 @@ class discord_ql_mover(minqlxtended.Plugin):
         return value
 
     @minqlxtended.next_frame
-    def _report_move_result(self, action, channel, moved, missing, failed, dry_run):
+    def _report_move_result(self, action, channel, moved, missing, failed, skipped_untracked, dry_run):
         mode = "DRY-RUN " if dry_run else ""
-        channel.reply("^2[DMover]^7 {}{} completed. moved:^6{}^7 missing-link:^6{}^7 failed:^6{}^7"
-                      .format(mode, action, len(moved), len(missing), len(failed)))
+        channel.reply(
+            "^2[DMover]^7 {}{} completed. moved:^6{}^7 missing-link:^6{}^7 skipped-untracked:^6{}^7 failed:^6{}^7"
+            .format(mode, action, len(moved), len(missing), len(skipped_untracked), len(failed))
+        )
 
         if missing:
             missing_names = ", ".join(["{}({})".format(name, steam_id) for name, steam_id in missing[:8]])
             channel.reply("^3[DMover]^7 Missing links: {}".format(missing_names))
+
+        if skipped_untracked:
+            skipped_names = ", ".join(
+                ["{}({})".format(name, steam_id) for name, steam_id, _ in skipped_untracked[:8]]
+            )
+            channel.reply("^3[DMover]^7 Skipped untracked players: {}".format(skipped_names))
 
         if failed:
             first = failed[0]
