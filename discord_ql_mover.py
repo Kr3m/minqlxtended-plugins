@@ -366,7 +366,9 @@ class discord_ql_mover(minqlxtended.Plugin):
     # ---------- Move flow ----------
     @minqlxtended.thread
     def _execute_move(self, action, channel, team_snapshot=None, force_move_discord_ids=None):
-        token = self.get_cvar("qlx_dmoverDiscordBotToken")
+        raw_token = self.get_cvar("qlx_dmoverDiscordBotToken") or ""
+        token = self._normalize_discord_bot_token(raw_token)
+        auth_diagnostics = self._discord_auth_diagnostics(raw_token, token)
         guild_id = self.get_cvar("qlx_dmoverDiscordGuildId")
         default_channel = self.get_cvar("qlx_dmoverDefaultChannelId")
         red_channel = self.get_cvar("qlx_dmoverRedChannelId")
@@ -402,7 +404,7 @@ class discord_ql_mover(minqlxtended.Plugin):
             self._move_player(
                 action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
                 blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-                force_move_discord_ids
+                force_move_discord_ids, auth_diagnostics
             )
 
         for player_name, steam_id in red_players:
@@ -410,7 +412,7 @@ class discord_ql_mover(minqlxtended.Plugin):
             self._move_player(
                 action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
                 blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-                force_move_discord_ids
+                force_move_discord_ids, auth_diagnostics
             )
 
         if action == "default":
@@ -418,7 +420,7 @@ class discord_ql_mover(minqlxtended.Plugin):
                 self._move_player(
                     action, player_name, steam_id, guild_id, token, default_channel, default_channel, red_channel,
                     blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-                    force_move_discord_ids
+                    force_move_discord_ids, auth_diagnostics
                 )
 
         self._report_move_result(
@@ -430,7 +432,7 @@ class discord_ql_mover(minqlxtended.Plugin):
     def _move_player(
         self, action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
         blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-        force_move_discord_ids
+        force_move_discord_ids, auth_diagnostics
     ):
         discord_id = self._get_discord_by_steam(steam_id)
         if discord_id is None:
@@ -442,8 +444,14 @@ class discord_ql_mover(minqlxtended.Plugin):
             skipped_untracked.append((player_name, steam_id, discord_id))
             return
 
-        ok, status, source_channel, body = self._discord_get_member_voice_channel(guild_id, discord_id, token)
+        ok, status, source_channel, body, voice_url = self._discord_get_member_voice_channel(
+            guild_id, discord_id, token
+        )
         if not ok:
+            self._log_discord_request_failure(
+                "voice_state_lookup", "GET", voice_url, guild_id, discord_id, target_channel,
+                status, body, auth_diagnostics, "voice-state lookup failed; no move preflight completed"
+            )
             failed.append((player_name, steam_id, discord_id, status, body))
             return
 
@@ -451,15 +459,18 @@ class discord_ql_mover(minqlxtended.Plugin):
             if source_channel != str(default_channel):
                 skipped_wrong_channel.append((player_name, steam_id, discord_id, source_channel, "teams"))
                 return
+            source_channel_check = "source_channel_matches_default"
         elif source_channel not in (str(red_channel), str(blue_channel)):
             skipped_wrong_channel.append((player_name, steam_id, discord_id, source_channel, "default"))
             return
+        else:
+            source_channel_check = "source_channel_matches_red_or_blue"
 
         if dry_run:
             moved.append((player_name, steam_id, discord_id, "dry-run"))
             return
 
-        ok, status, body = self._discord_move_member(guild_id, discord_id, target_channel, token)
+        ok, status, body, move_url = self._discord_move_member(guild_id, discord_id, target_channel, token)
         if ok:
             moved.append((player_name, steam_id, discord_id, str(status)))
             if action == "teams":
@@ -467,6 +478,14 @@ class discord_ql_mover(minqlxtended.Plugin):
             elif action == "default":
                 self.active_match_users.discard(discord_id)
         else:
+            preflight = (
+                "voice_state_lookup_succeeded; source_channel_id={}; {}; "
+                "bot_permissions=not_checked; role_hierarchy=not_checked"
+            ).format(source_channel, source_channel_check)
+            self._log_discord_request_failure(
+                "member_move", "PATCH", move_url, guild_id, discord_id, target_channel,
+                status, body, auth_diagnostics, preflight
+            )
             failed.append((player_name, steam_id, discord_id, status, body))
 
     def _resolve_forced_spectator_discord_ids(self, spectator_players):
@@ -484,17 +503,17 @@ class discord_ql_mover(minqlxtended.Plugin):
         ok, status, body = self._discord_get_json(url, token, timeout_seconds)
         if not ok:
             if status == 404:
-                return True, status, None, ""
-            return False, status, None, body
+                return True, status, None, "", url
+            return False, status, None, body, url
 
         channel_id = body.get("channel_id")
         if channel_id is None:
-            return True, status, None, ""
-        return True, status, str(channel_id), ""
+            return True, status, None, "", url
+        return True, status, str(channel_id), "", url
 
     def _discord_get_json(self, url, token, timeout_seconds):
         headers = {
-            "Authorization": "Bot {}".format(token),
+            "Authorization": self._discord_authorization_header(token),
             "User-Agent": "discord-ql-mover/1.0",
         }
 
@@ -534,11 +553,12 @@ class discord_ql_mover(minqlxtended.Plugin):
         url = "https://discord.com/api/v10/guilds/{}/members/{}".format(guild_id, discord_id)
         timeout_seconds = self.get_cvar("qlx_dmoverRequestTimeoutSeconds", float)
 
-        return self._patch_discord_member(url, payload, token, timeout_seconds)
+        ok, status, body = self._patch_discord_member(url, payload, token, timeout_seconds)
+        return ok, status, body, url
 
     def _patch_discord_member(self, url, payload, token, timeout_seconds):
         headers = {
-            "Authorization": "Bot {}".format(token),
+            "Authorization": self._discord_authorization_header(token),
             "Content-Type": "application/json",
             "User-Agent": "discord-ql-mover/1.0",
         }
@@ -567,6 +587,50 @@ class discord_ql_mover(minqlxtended.Plugin):
             return False, status, body
         except urllib.error.URLError as err:
             return False, -1, str(err.reason)
+
+    def _normalize_discord_bot_token(self, raw_token):
+        token = str(raw_token).strip()
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in ("'", '"'):
+            token = token[1:-1].strip()
+        return token
+
+    def _discord_authorization_header(self, token):
+        return "Bot {}".format(token)
+
+    def _discord_auth_diagnostics(self, raw_token, token):
+        raw_token = str(raw_token)
+        return {
+            "authorization_header_present": bool(self._discord_authorization_header(token)),
+            "authorization_prefix": "Bot",
+            "token_raw_length": len(raw_token),
+            "token_effective_length": len(token),
+            "token_normalized": raw_token != token,
+        }
+
+    def _log_discord_request_failure(
+        self, stage, method, url, guild_id, discord_id, target_channel, status, body, auth_diagnostics, preflight
+    ):
+        self.logger.warning(
+            "[DMover] Discord request failed stage=%s method=%s status=%s url=%s "
+            "guild_id=%s user_id=%s target_channel_id=%s "
+            "authorization_header_present=%s authorization_prefix=%s "
+            "token_raw_length=%s token_effective_length=%s token_normalized=%s "
+            "preflight=%s body=%s",
+            stage,
+            method,
+            status,
+            url,
+            guild_id,
+            discord_id,
+            target_channel,
+            auth_diagnostics["authorization_header_present"],
+            auth_diagnostics["authorization_prefix"],
+            auth_diagnostics["token_raw_length"],
+            auth_diagnostics["token_effective_length"],
+            auth_diagnostics["token_normalized"],
+            preflight,
+            (body or "")[:300],
+        )
 
     def _parse_retry_after(self, body):
         try:
@@ -756,7 +820,7 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     # ---------- Validation / permissions ----------
     def _validate_runtime_config(self):
-        token = self.get_cvar("qlx_dmoverDiscordBotToken")
+        token = self._normalize_discord_bot_token(self.get_cvar("qlx_dmoverDiscordBotToken") or "")
         guild_id = self.get_cvar("qlx_dmoverDiscordGuildId")
         default_channel = self.get_cvar("qlx_dmoverDefaultChannelId")
         red_channel = self.get_cvar("qlx_dmoverRedChannelId")
