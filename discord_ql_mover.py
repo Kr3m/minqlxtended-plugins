@@ -1,7 +1,9 @@
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+from urllib.parse import urlsplit
 
 import minqlxtended
 import minqlxtended.database
@@ -20,6 +22,12 @@ class discord_ql_mover(minqlxtended.Plugin):
     def __init__(self):
         super().__init__()
 
+        self.set_cvar_once("qlx_fragdex_api_url", "https://fragdex.kr3m.one/api/v1")
+        self.set_cvar_once("qlx_fragdex_api_key", "")
+        self.set_cvar_once("qlx_fragdex_token_refresh_interval", "3600")
+        self.set_cvar_once("qlx_dmoverUseFragdexMappings", "1")
+        self.set_cvar_once("qlx_dmoverUseRedisMappingFallback", "0")
+        self.set_cvar_once("qlx_dmoverUseCvarDiscordBotToken", "0")
         self.set_cvar_once("qlx_dmoverDiscordBotToken", "")
         self.set_cvar_once("qlx_dmoverDiscordGuildId", "")
         self.set_cvar_once("qlx_dmoverDefaultChannelId", "")
@@ -44,8 +52,90 @@ class discord_ql_mover(minqlxtended.Plugin):
 
         self._last_move_ts = 0.0
         self._last_auto_teams_move_ts = 0.0
+        self._cached_discord_bot_token = ""
+        self._fragdex_token_refresh_timer = None
+        if not self.get_cvar("qlx_dmoverUseCvarDiscordBotToken", bool):
+            self._fetch_fragdex_discord_token()
+            token_refresh_interval = self.get_cvar("qlx_fragdex_token_refresh_interval", float)
+            if token_refresh_interval > 0:
+                self._fragdex_token_refresh_timer = self.repeat(
+                    token_refresh_interval, self._fetch_fragdex_discord_token
+                )
+            elif token_refresh_interval < 0:
+                self.logger.warning(
+                    "Invalid qlx_fragdex_token_refresh_interval %s; token refresh is disabled.",
+                    token_refresh_interval,
+                )
         self.moved_users_by_bot = set()
         self.active_match_users = self.moved_users_by_bot
+
+    def _discord_bot_token(self):
+        if self.get_cvar("qlx_dmoverUseCvarDiscordBotToken", bool):
+            raw_token = self.get_cvar("qlx_dmoverDiscordBotToken") or ""
+        else:
+            raw_token = self._cached_discord_bot_token
+        return raw_token, self._normalize_discord_bot_token(raw_token)
+
+    @minqlxtended.thread
+    def _fetch_fragdex_discord_token(self):
+        api_url = str(self.get_cvar("qlx_fragdex_api_url") or "").strip()
+        try:
+            parsed_url = urlsplit(api_url)
+        except ValueError:
+            self.logger.warning("Fragdex Discord token fetch failed: invalid qlx_fragdex_api_url.")
+            return
+        if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+            self.logger.warning(
+                "Fragdex Discord token fetch failed: qlx_fragdex_api_url must be an http:// or https:// URL."
+            )
+            return
+
+        api_key = str(self.get_cvar("qlx_fragdex_api_key") or "").strip()
+        if not api_key:
+            self.logger.warning("Fragdex Discord token fetch failed: qlx_fragdex_api_key is not configured.")
+            return
+
+        token_url = "{}/discord/token".format(api_url.rstrip("/"))
+        try:
+            request = urllib.request.Request(
+                url=token_url,
+                headers={"Authorization": "Bearer {}".format(api_key), "Accept": "application/json"},
+                method="GET",
+            )
+        except ValueError:
+            self.logger.warning("Fragdex Discord token fetch failed: invalid qlx_fragdex_api_url.")
+            return
+        timeout_seconds = self.get_cvar("qlx_dmoverRequestTimeoutSeconds", float)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                body = response.read(65537)
+            if len(body) > 65536:
+                self.logger.warning("Fragdex Discord token fetch failed: response was too large.")
+                return
+            payload = json.loads(body.decode("utf-8"))
+            token = payload.get("token") if isinstance(payload, dict) else None
+            if not isinstance(token, str):
+                self.logger.warning("Fragdex Discord token fetch failed: response did not contain a token.")
+                return
+            token = self._normalize_discord_bot_token(token or "")
+            if not token:
+                self.logger.warning("Fragdex Discord token fetch failed: response did not contain a token.")
+                return
+        except urllib.error.HTTPError as error:
+            self.logger.warning("Fragdex Discord token fetch failed: HTTP %s.", error.code)
+            return
+        except urllib.error.URLError as error:
+            self.logger.warning("Fragdex Discord token fetch failed: network error: %s.", error.reason)
+            return
+        except (UnicodeDecodeError, ValueError):
+            self.logger.warning("Fragdex Discord token fetch failed: invalid JSON response.")
+            return
+        except OSError as error:
+            self.logger.warning("Fragdex Discord token fetch failed: request error: %s.", error)
+            return
+
+        self._cached_discord_bot_token = token
+        self.logger.info("Obtained Discord bot token from Fragdex.")
 
     # ---------- Commands ----------
     def handle_game_countdown(self):
@@ -89,20 +179,25 @@ class discord_ql_mover(minqlxtended.Plugin):
             [(player.clean_name, str(player.steam_id)) for player in teams.get("red", [])],
             spectator_players,
         )
-        forced_default_discord_ids = self._resolve_forced_spectator_discord_ids(spectator_players)
-        self._move_default_after_game_end(team_snapshot, forced_default_discord_ids)
+        self._move_default_after_game_end(team_snapshot, spectator_players)
 
     @minqlxtended.delay(2)
     @minqlxtended.thread
-    def _move_default_after_game_end(self, team_snapshot, forced_default_discord_ids):
+    def _move_default_after_game_end(self, team_snapshot, spectator_players):
         config_error = self._validate_runtime_config()
         if config_error is not None:
             self.msg("^1[DMover]^7 Automatic map-end move skipped: {}".format(config_error))
             return
 
+        player_ids = [steam_id for players in team_snapshot for _, steam_id in players]
+        discord_mappings = self._get_discord_mappings(player_ids)
+        forced_default_discord_ids = self._resolve_forced_spectator_discord_ids(
+            spectator_players, discord_mappings
+        )
         self.msg("^2[DMover]^7 Map ended; returning tracked match players (and spectators in red/blue voice) to the default voice channel.")
         self._execute_move(
-            "default", minqlxtended.CHAT_CHANNEL, team_snapshot, force_move_discord_ids=forced_default_discord_ids
+            "default", minqlxtended.CHAT_CHANNEL, team_snapshot, force_move_discord_ids=forced_default_discord_ids,
+            discord_mappings=discord_mappings
         )
 
     def cmd_move(self, player, msg, channel):
@@ -141,6 +236,13 @@ class discord_ql_mover(minqlxtended.Plugin):
         if not self._require_permission(player, channel):
             return minqlxtended.Return.STOP_ALL
 
+        if not self._redis_mapping_commands_enabled():
+            channel.reply(
+                "^1[DMover]^7 Manage player links in Fragdex, or enable "
+                "^6qlx_dmoverUseRedisMappingFallback^7 to store Redis-only fallback links."
+            )
+            return minqlxtended.Return.STOP_ALL
+
         if len(msg) < 3:
             return minqlxtended.Return.USAGE
 
@@ -169,6 +271,13 @@ class discord_ql_mover(minqlxtended.Plugin):
         if not self._require_permission(player, channel):
             return minqlxtended.Return.STOP_ALL
 
+        if not self._redis_mapping_commands_enabled():
+            channel.reply(
+                "^1[DMover]^7 Manage player links in Fragdex, or enable "
+                "^6qlx_dmoverUseRedisMappingFallback^7 to remove Redis-only fallback links."
+            )
+            return minqlxtended.Return.STOP_ALL
+
         if len(msg) < 2:
             return minqlxtended.Return.USAGE
 
@@ -179,9 +288,9 @@ class discord_ql_mover(minqlxtended.Plugin):
             return minqlxtended.Return.STOP_ALL
 
         if steam_id is None and discord_id is not None:
-            steam_id = self._get_steam_by_discord(discord_id)
+            steam_id = self._get_redis_steam_by_discord(discord_id)
         if discord_id is None and steam_id is not None:
-            discord_id = self._get_discord_by_steam(steam_id)
+            discord_id = self._get_redis_discord_by_steam(steam_id)
 
         if steam_id is None or discord_id is None:
             channel.reply("^1[DMover]^7 Incomplete mapping detected; cannot unlink safely.")
@@ -196,34 +305,43 @@ class discord_ql_mover(minqlxtended.Plugin):
             return minqlxtended.Return.USAGE
 
         target = msg[1]
-        steam_id, discord_id = self._resolve_link_target(target)
+        steam_id = self._resolve_steam_id(target)
+        is_client_id = target.isdigit() and int(target) < 64
+        self._whois_background(target, steam_id, is_client_id, channel)
+        return minqlxtended.Return.STOP_ALL
 
-        if steam_id is None and discord_id is None:
-            discord_id = self._get_discord_by_name(target)
+    @minqlxtended.thread
+    def _whois_background(self, target, steam_id, is_client_id, channel):
+        discord_id = self._get_discord_by_steam(steam_id) if steam_id is not None else None
+        if discord_id is None and not is_client_id:
+            discord_id = self._normalize_discord_id(target)
+            if discord_id is None:
+                discord_id = self._get_discord_by_name(target)
             if discord_id is not None:
                 steam_id = self._get_steam_by_discord(discord_id)
-
-        if steam_id is None and discord_id is None:
-            channel.reply("^1[DMover]^7 No mapping found for ^6{}^7.".format(target))
-            return minqlxtended.Return.STOP_ALL
-
-        if steam_id is None:
-            steam_id = self._get_steam_by_discord(discord_id)
-        if discord_id is None:
-            discord_id = self._get_discord_by_steam(steam_id)
+                if steam_id is None:
+                    discord_id = None
+        elif discord_id is None:
+            steam_id = None
+        if discord_id is None and steam_id is None:
+            self._reply_whois_mapping(channel, target, None, None, None)
+            return
 
         discord_name = self._get_discord_name(discord_id) if discord_id is not None else None
+        self._reply_whois_mapping(channel, target, steam_id, discord_id, discord_name)
+        if steam_id is not None:
+            self._append_whois_steam_persona_name(steam_id, channel)
 
-        if discord_name:
+    @minqlxtended.next_frame
+    def _reply_whois_mapping(self, channel, target, steam_id, discord_id, discord_name):
+        if steam_id is None and discord_id is None:
+            channel.reply("^1[DMover]^7 No mapping found for ^6{}^7.".format(target))
+        elif discord_name:
             channel.reply("^2[DMover]^7 steam ^6{}^7 <-> discord ^6{}^7 (^6{}^7)."
                           .format(steam_id, discord_id, discord_name))
         else:
             channel.reply("^2[DMover]^7 steam ^6{}^7 <-> discord ^6{}^7."
                           .format(steam_id, discord_id))
-
-        if steam_id is not None:
-            self._append_whois_steam_persona_name(steam_id, channel)
-        return minqlxtended.Return.STOP_ALL
 
     @minqlxtended.thread
     def _append_whois_steam_persona_name(self, steam_id, channel):
@@ -334,6 +452,13 @@ class discord_ql_mover(minqlxtended.Plugin):
         return clean_persona_name
 
     def cmd_links(self, player, msg, channel):
+        if not self._redis_mapping_commands_enabled():
+            channel.reply(
+                "^1[DMover]^7 Redis mappings are disabled; manage player links in Fragdex or enable "
+                "^6qlx_dmoverUseRedisMappingFallback^7."
+            )
+            return minqlxtended.Return.STOP_ALL
+
         limit = 20
         if len(msg) > 1:
             try:
@@ -353,10 +478,10 @@ class discord_ql_mover(minqlxtended.Plugin):
 
         channel.reply("^3[DMover]^7 Showing {} of {} links:".format(min(limit, len(steam_ids)), len(steam_ids)))
         for steam_id in steam_ids[:limit]:
-            discord_id = self._get_discord_by_steam(steam_id)
+            discord_id = self._get_redis_discord_by_steam(steam_id)
             if discord_id is None:
                 continue
-            discord_name = self._get_discord_name(discord_id)
+            discord_name = self._get_redis_discord_name(discord_id)
             if discord_name:
                 channel.reply("  ^6{}^7 -> ^6{}^7 (^6{}^7)".format(steam_id, discord_id, discord_name))
             else:
@@ -365,9 +490,8 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     # ---------- Move flow ----------
     @minqlxtended.thread
-    def _execute_move(self, action, channel, team_snapshot=None, force_move_discord_ids=None):
-        raw_token = self.get_cvar("qlx_dmoverDiscordBotToken") or ""
-        token = self._normalize_discord_bot_token(raw_token)
+    def _execute_move(self, action, channel, team_snapshot=None, force_move_discord_ids=None, discord_mappings=None):
+        raw_token, token = self._discord_bot_token()
         auth_diagnostics = self._discord_auth_diagnostics(raw_token, token)
         guild_id = self.get_cvar("qlx_dmoverDiscordGuildId")
         default_channel = self.get_cvar("qlx_dmoverDefaultChannelId")
@@ -390,6 +514,12 @@ class discord_ql_mover(minqlxtended.Plugin):
                 blue_players, red_players = team_snapshot
                 spectator_players = []
 
+        if discord_mappings is None:
+            player_ids = [steam_id for players in (blue_players, red_players) for _, steam_id in players]
+            if action == "default":
+                player_ids.extend(steam_id for _, steam_id in spectator_players)
+            discord_mappings = self._get_discord_mappings(player_ids)
+
         if action == "teams":
             self.active_match_users.clear()
 
@@ -404,7 +534,7 @@ class discord_ql_mover(minqlxtended.Plugin):
             self._move_player(
                 action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
                 blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-                force_move_discord_ids, auth_diagnostics
+                force_move_discord_ids, auth_diagnostics, discord_mappings
             )
 
         for player_name, steam_id in red_players:
@@ -412,7 +542,7 @@ class discord_ql_mover(minqlxtended.Plugin):
             self._move_player(
                 action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
                 blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-                force_move_discord_ids, auth_diagnostics
+                force_move_discord_ids, auth_diagnostics, discord_mappings
             )
 
         if action == "default":
@@ -420,7 +550,7 @@ class discord_ql_mover(minqlxtended.Plugin):
                 self._move_player(
                     action, player_name, steam_id, guild_id, token, default_channel, default_channel, red_channel,
                     blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-                    force_move_discord_ids, auth_diagnostics
+                    force_move_discord_ids, auth_diagnostics, discord_mappings
                 )
 
         self._report_move_result(
@@ -432,9 +562,9 @@ class discord_ql_mover(minqlxtended.Plugin):
     def _move_player(
         self, action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
         blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
-        force_move_discord_ids, auth_diagnostics
+        force_move_discord_ids, auth_diagnostics, discord_mappings
     ):
-        discord_id = self._get_discord_by_steam(steam_id)
+        discord_id = discord_mappings.get(str(steam_id))
         if discord_id is None:
             missing.append((player_name, steam_id))
             return
@@ -488,10 +618,10 @@ class discord_ql_mover(minqlxtended.Plugin):
             )
             failed.append((player_name, steam_id, discord_id, status, body))
 
-    def _resolve_forced_spectator_discord_ids(self, spectator_players):
+    def _resolve_forced_spectator_discord_ids(self, spectator_players, discord_mappings):
         forced_ids = set()
         for _, steam_id in spectator_players:
-            discord_id = self._get_discord_by_steam(steam_id)
+            discord_id = discord_mappings.get(str(steam_id))
             if discord_id is not None:
                 forced_ids.add(discord_id)
         return forced_ids
@@ -687,11 +817,11 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     # ---------- Mapping ----------
     def _set_mapping(self, steam_id, discord_id, discord_name=None):
-        old_discord = self._get_discord_by_steam(steam_id)
+        old_discord = self._get_redis_discord_by_steam(steam_id)
         if old_discord is not None and old_discord != discord_id:
             self._delete_mapping(steam_id, old_discord)
 
-        old_steam = self._get_steam_by_discord(discord_id)
+        old_steam = self._get_redis_steam_by_discord(discord_id)
         if old_steam is not None and old_steam != steam_id:
             self._delete_mapping(old_steam, discord_id)
 
@@ -730,7 +860,7 @@ class discord_ql_mover(minqlxtended.Plugin):
         if not discord_name:
             return
 
-        old_name = self._get_discord_name(discord_id)
+        old_name = self._get_redis_discord_name(discord_id)
         if old_name is not None:
             old_norm = self._normalize_discord_name(old_name)
             if old_norm:
@@ -747,11 +877,11 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     def _resolve_link_target(self, token):
         steam_id = self._resolve_steam_id(token)
-        if steam_id is not None and self._get_discord_by_steam(steam_id) is not None:
+        if steam_id is not None and self._get_redis_discord_by_steam(steam_id) is not None:
             return steam_id, None
 
         discord_id = self._normalize_discord_id(token)
-        if discord_id is not None and self._get_steam_by_discord(discord_id) is not None:
+        if discord_id is not None and self._get_redis_steam_by_discord(discord_id) is not None:
             return None, discord_id
 
         return None, None
@@ -787,24 +917,227 @@ class discord_ql_mover(minqlxtended.Plugin):
         return normalized
 
     def _get_discord_by_steam(self, steam_id):
+        if not self._fragdex_mapping_source_enabled():
+            return self._get_redis_discord_by_steam(steam_id)
+
+        data, error = self._fragdex_api_request(
+            "/players/{}".format(urllib.parse.quote(str(steam_id), safe=""))
+        )
+        if error:
+            self.logger.warning("Fragdex mapping lookup failed for Steam ID %s: %s.", steam_id, error)
+        else:
+            discord_id = data.get("discord_id")
+            if isinstance(discord_id, str) and discord_id.isdigit():
+                return discord_id
+            self.logger.warning("Fragdex has no Discord mapping for Steam ID %s.", steam_id)
+        if self._redis_mapping_fallback_enabled():
+            return self._get_redis_discord_by_steam(steam_id)
+        return None
+
+    def _get_steam_by_discord(self, discord_id):
+        if not self._fragdex_mapping_source_enabled():
+            return self._get_redis_steam_by_discord(discord_id)
+
+        data, error = self._fragdex_api_request(
+            "/discord/{}".format(urllib.parse.quote(str(discord_id), safe=""))
+        )
+        if error:
+            self.logger.warning("Fragdex mapping lookup failed for Discord ID %s: %s.", discord_id, error)
+        else:
+            players = data.get("players")
+            if isinstance(players, list):
+                matches = [p for p in players if isinstance(p, dict) and p.get("steam_id")]
+                if len(matches) == 1:
+                    return str(matches[0]["steam_id"])
+                if len(matches) > 1:
+                    self.logger.warning(
+                        "Fragdex returned multiple Steam mappings for Discord ID %s; skipping ambiguous lookup.",
+                        discord_id,
+                    )
+                else:
+                    self.logger.warning("Fragdex has no Steam mapping for Discord ID %s.", discord_id)
+            else:
+                self.logger.warning("Fragdex returned an invalid Discord lookup response.")
+        if self._redis_mapping_fallback_enabled():
+            return self._get_redis_steam_by_discord(discord_id)
+        return None
+
+    def _get_discord_name(self, discord_id):
+        if not self._fragdex_mapping_source_enabled():
+            return self._get_redis_discord_name(discord_id)
+
+        data, error = self._fragdex_api_request(
+            "/discord/{}".format(urllib.parse.quote(str(discord_id), safe=""))
+        )
+        if error:
+            self.logger.warning("Fragdex name lookup failed for Discord ID %s: %s.", discord_id, error)
+        else:
+            players = data.get("players")
+            if not isinstance(players, list):
+                self.logger.warning("Fragdex returned an invalid Discord name lookup response.")
+            elif players:
+                name = players[0].get("discord_name") if isinstance(players[0], dict) else None
+                if isinstance(name, str) and name:
+                    return name
+        if self._redis_mapping_fallback_enabled():
+            return self._get_redis_discord_name(discord_id)
+        return None
+
+    def _get_discord_by_name(self, discord_name):
+        if not self._fragdex_mapping_source_enabled():
+            return self._get_redis_discord_by_name(discord_name)
+
+        data, error = self._fragdex_api_request(
+            "/discord/{}".format(urllib.parse.quote(str(discord_name), safe=""))
+        )
+        if error:
+            self.logger.warning("Fragdex name lookup failed for %s: %s.", discord_name, error)
+        else:
+            players = data.get("players")
+            if not isinstance(players, list):
+                self.logger.warning("Fragdex returned an invalid Discord name lookup response.")
+            else:
+                ids = {
+                    p["discord_id"] for p in players
+                    if isinstance(p, dict) and isinstance(p.get("discord_id"), str) and p["discord_id"]
+                }
+                if len(ids) == 1:
+                    return next(iter(ids))
+                if len(ids) > 1:
+                    self.logger.warning("Fragdex returned multiple Discord accounts matching %s.", discord_name)
+                else:
+                    self.logger.warning("Fragdex has no mapping for Discord name %s.", discord_name)
+        if self._redis_mapping_fallback_enabled():
+            return self._get_redis_discord_by_name(discord_name)
+        return None
+
+    def _fragdex_api_request(self, path, body=None):
+        api_url = str(self.get_cvar("qlx_fragdex_api_url") or "").strip().rstrip("/")
+        try:
+            parsed_url = urlsplit(api_url)
+        except ValueError:
+            return None, "invalid qlx_fragdex_api_url"
+        if (
+            parsed_url.scheme not in ("http", "https")
+            or not parsed_url.netloc
+            or parsed_url.query
+            or parsed_url.fragment
+        ):
+            return None, "qlx_fragdex_api_url must be an http:// or https:// API base URL"
+
+        api_key = str(self.get_cvar("qlx_fragdex_api_key") or "").strip()
+        if not api_key:
+            return None, "qlx_fragdex_api_key is not configured"
+
+        timeout_seconds = self.get_cvar("qlx_dmoverRequestTimeoutSeconds", float)
+        try:
+            request_body = json.dumps(body).encode("utf-8") if body is not None else None
+            headers = {"Authorization": "Bearer {}".format(api_key), "Accept": "application/json"}
+            if request_body is not None:
+                headers["Content-Type"] = "application/json"
+            request = urllib.request.Request(
+                url=api_url + path, data=request_body, headers=headers,
+                method="POST" if request_body is not None else "GET",
+            )
+            with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                body = response.read(262145)
+            if len(body) > 262144:
+                return None, "response was too large"
+            payload = json.loads(body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                return None, "invalid JSON response"
+            return payload, None
+        except urllib.error.HTTPError as error:
+            retry_after = error.headers.get("Retry-After") if error.headers else None
+            suffix = " (retry after {}s)".format(retry_after) if retry_after else ""
+            return None, "HTTP {}{}".format(error.code, suffix)
+        except urllib.error.URLError as error:
+            return None, "network error: {}".format(error.reason)
+        except (OSError, UnicodeDecodeError, ValueError) as error:
+            return None, "request failed: {}".format(error)
+
+    def _get_discord_mappings(self, steam_ids):
+        ids = list(dict.fromkeys(str(steam_id) for steam_id in steam_ids))
+        if not self._fragdex_mapping_source_enabled():
+            return {
+                steam_id: discord_id
+                for steam_id in ids
+                if (discord_id := self._get_redis_discord_by_steam(steam_id)) is not None
+            }
+
+        mappings = {}
+        for offset in range(0, len(ids), 100):
+            batch = ids[offset:offset + 100]
+            data, error = self._fragdex_api_request("/players/lookup", {"steam_ids": batch})
+            if error:
+                self.logger.warning("Fragdex batch mapping lookup failed: %s.", error)
+                if self._redis_mapping_fallback_enabled():
+                    for steam_id in batch:
+                        discord_id = self._get_redis_discord_by_steam(steam_id)
+                        if discord_id is not None:
+                            mappings[steam_id] = discord_id
+                continue
+
+            players = data.get("players")
+            if not isinstance(players, list):
+                self.logger.warning("Fragdex returned an invalid batch mapping response.")
+                if self._redis_mapping_fallback_enabled():
+                    for steam_id in batch:
+                        discord_id = self._get_redis_discord_by_steam(steam_id)
+                        if discord_id is not None:
+                            mappings[steam_id] = discord_id
+                continue
+
+            results = {
+                player.get("steam_id"): player
+                for player in players
+                if isinstance(player, dict) and isinstance(player.get("steam_id"), str)
+            }
+            for steam_id in batch:
+                player = results.get(steam_id)
+                discord_id = player.get("discord_id") if player else None
+                if isinstance(discord_id, str) and discord_id.isdigit():
+                    mappings[steam_id] = discord_id
+                    continue
+
+                self.logger.warning("Fragdex has no Discord mapping for Steam ID %s.", steam_id)
+                if self._redis_mapping_fallback_enabled():
+                    fallback_discord_id = self._get_redis_discord_by_steam(steam_id)
+                    if fallback_discord_id is not None:
+                        mappings[steam_id] = fallback_discord_id
+        return mappings
+
+    def _redis_mapping_fallback_enabled(self):
+        return self.get_cvar("qlx_dmoverUseRedisMappingFallback", bool)
+
+    def _fragdex_mapping_source_enabled(self):
+        return self.get_cvar("qlx_dmoverUseFragdexMappings", bool)
+
+    def _redis_mapping_commands_enabled(self):
+        return (
+            not self._fragdex_mapping_source_enabled()
+            or self._redis_mapping_fallback_enabled()
+        )
+
+    def _get_redis_discord_by_steam(self, steam_id):
         key = self.KEY_STEAM_TO_DISCORD.format(steam_id)
         if key not in self.db:
             return None
         return self._decode(self.db[key])
 
-    def _get_steam_by_discord(self, discord_id):
+    def _get_redis_steam_by_discord(self, discord_id):
         key = self.KEY_DISCORD_TO_STEAM.format(discord_id)
         if key not in self.db:
             return None
         return self._decode(self.db[key])
 
-    def _get_discord_name(self, discord_id):
+    def _get_redis_discord_name(self, discord_id):
         key = self.KEY_DISCORD_NAME.format(discord_id)
         if key not in self.db:
             return None
         return self._decode(self.db[key])
 
-    def _get_discord_by_name(self, discord_name):
+    def _get_redis_discord_by_name(self, discord_name):
         normalized = self._normalize_discord_name(discord_name)
         if normalized is None:
             return None
@@ -820,14 +1153,16 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     # ---------- Validation / permissions ----------
     def _validate_runtime_config(self):
-        token = self._normalize_discord_bot_token(self.get_cvar("qlx_dmoverDiscordBotToken") or "")
+        _, token = self._discord_bot_token()
         guild_id = self.get_cvar("qlx_dmoverDiscordGuildId")
         default_channel = self.get_cvar("qlx_dmoverDefaultChannelId")
         red_channel = self.get_cvar("qlx_dmoverRedChannelId")
         blue_channel = self.get_cvar("qlx_dmoverBlueChannelId")
 
         if not token:
-            return "Missing qlx_dmoverDiscordBotToken."
+            if self.get_cvar("qlx_dmoverUseCvarDiscordBotToken", bool):
+                return "Missing qlx_dmoverDiscordBotToken while qlx_dmoverUseCvarDiscordBotToken is enabled."
+            return "Discord bot token has not been obtained from Fragdex."
         if not guild_id:
             return "Missing qlx_dmoverDiscordGuildId."
         if not default_channel:
