@@ -9,6 +9,14 @@ import minqlxtended
 import minqlxtended.database
 
 
+def _build_api_url(base, path):
+    api_base = str(base or "").strip().rstrip("/")
+    while api_base.endswith("/api/v1"):
+        api_base = api_base[:-7].rstrip("/")
+    api_base += "/api/v1"
+    return "{}/{}".format(api_base, str(path or "").lstrip("/"))
+
+
 class discord_ql_mover(minqlxtended.Plugin):
     database = minqlxtended.database.Redis
 
@@ -22,8 +30,6 @@ class discord_ql_mover(minqlxtended.Plugin):
     def __init__(self):
         super().__init__()
 
-        self.set_cvar_once("qlx_fragdex_api_url", "https://fragdex.kr3m.one/api/v1")
-        self.set_cvar_once("qlx_fragdex_api_key", "")
         self.set_cvar_once("qlx_fragdex_token_refresh_interval", "3600")
         self.set_cvar_once("qlx_dmoverUseFragdexMappings", "1")
         self.set_cvar_once("qlx_dmoverUseRedisMappingFallback", "0")
@@ -78,24 +84,24 @@ class discord_ql_mover(minqlxtended.Plugin):
 
     @minqlxtended.thread
     def _fetch_fragdex_discord_token(self):
-        api_url = str(self.get_cvar("qlx_fragdex_api_url") or "").strip()
+        api_url = str(self.get_cvar("qlx_fragdexUrl") or "").strip()
         try:
             parsed_url = urlsplit(api_url)
         except ValueError:
-            self.logger.warning("Fragdex Discord token fetch failed: invalid qlx_fragdex_api_url.")
+            self.logger.warning("Fragdex Discord token fetch failed: invalid qlx_fragdexUrl.")
             return
         if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
             self.logger.warning(
-                "Fragdex Discord token fetch failed: qlx_fragdex_api_url must be an http:// or https:// URL."
+                "Fragdex Discord token fetch failed: qlx_fragdexUrl must be an http:// or https:// URL."
             )
             return
 
-        api_key = str(self.get_cvar("qlx_fragdex_api_key") or "").strip()
+        api_key = str(self.get_cvar("qlx_fragdexKey") or "").strip()
         if not api_key:
-            self.logger.warning("Fragdex Discord token fetch failed: qlx_fragdex_api_key is not configured.")
+            self.logger.warning("Fragdex Discord token fetch failed: qlx_fragdexKey is not configured.")
             return
 
-        token_url = "{}/discord/token".format(api_url.rstrip("/"))
+        token_url = _build_api_url(api_url, "discord/token")
         try:
             request = urllib.request.Request(
                 url=token_url,
@@ -103,7 +109,7 @@ class discord_ql_mover(minqlxtended.Plugin):
                 method="GET",
             )
         except ValueError:
-            self.logger.warning("Fragdex Discord token fetch failed: invalid qlx_fragdex_api_url.")
+            self.logger.warning("Fragdex Discord token fetch failed: invalid qlx_fragdexUrl.")
             return
         timeout_seconds = self.get_cvar("qlx_dmoverRequestTimeoutSeconds", float)
         try:
@@ -1012,22 +1018,22 @@ class discord_ql_mover(minqlxtended.Plugin):
         return None
 
     def _fragdex_api_request(self, path, body=None):
-        api_url = str(self.get_cvar("qlx_fragdex_api_url") or "").strip().rstrip("/")
+        api_url = str(self.get_cvar("qlx_fragdexUrl") or "").strip().rstrip("/")
         try:
             parsed_url = urlsplit(api_url)
         except ValueError:
-            return None, "invalid qlx_fragdex_api_url"
+            return None, "invalid qlx_fragdexUrl"
         if (
             parsed_url.scheme not in ("http", "https")
             or not parsed_url.netloc
             or parsed_url.query
             or parsed_url.fragment
         ):
-            return None, "qlx_fragdex_api_url must be an http:// or https:// API base URL"
+            return None, "qlx_fragdexUrl must be an http:// or https:// URL"
 
-        api_key = str(self.get_cvar("qlx_fragdex_api_key") or "").strip()
+        api_key = str(self.get_cvar("qlx_fragdexKey") or "").strip()
         if not api_key:
-            return None, "qlx_fragdex_api_key is not configured"
+            return None, "qlx_fragdexKey is not configured"
 
         timeout_seconds = self.get_cvar("qlx_dmoverRequestTimeoutSeconds", float)
         try:
@@ -1036,7 +1042,7 @@ class discord_ql_mover(minqlxtended.Plugin):
             if request_body is not None:
                 headers["Content-Type"] = "application/json"
             request = urllib.request.Request(
-                url=api_url + path, data=request_body, headers=headers,
+                url=_build_api_url(api_url, path), data=request_body, headers=headers,
                 method="POST" if request_body is not None else "GET",
             )
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
