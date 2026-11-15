@@ -56,9 +56,11 @@ class discord_ql_mover(minqlxtended.Plugin):
         self.add_command("links", self.cmd_links, usage="[limit]")
         self.add_hook("game_countdown", self.handle_game_countdown)
         self.add_hook("game_end", self.handle_game_end)
+        self.add_hook("new_game", self.handle_new_game)
 
         self._last_move_ts = 0.0
         self._last_auto_teams_move_ts = 0.0
+        self._move_generation = 0
         self._cached_discord_bot_token = ""
         self._fragdex_token_refresh_timer = None
         if not self.get_cvar("qlx_dmoverUseCvarDiscordBotToken", bool):
@@ -181,6 +183,7 @@ class discord_ql_mover(minqlxtended.Plugin):
             return
 
         self._last_auto_teams_move_ts = time.time()
+        self._move_generation += 1
         self.msg("^2[DMover]^7 Match starting; moving mapped players to their team voice channels.")
         self._execute_move("teams", minqlxtended.CHAT_CHANNEL)
 
@@ -192,12 +195,30 @@ class discord_ql_mover(minqlxtended.Plugin):
         now = time.time()
         return now >= self._last_auto_teams_move_ts + min_interval
 
+    def handle_new_game(self):
+        # !abort / abort vote run map_restart, which raises new_game in warmup and never raises game_end.
+        state = self.game.state if self.game else None
+        tracked = len(self.active_match_users)
+        self.logger.info("new_game fired: state=%s tracked=%d", state, tracked)
+        if state != "warmup" or not tracked:
+            return
+        if not self.get_cvar("qlx_dmoverAutoMoveDefaultOnAbort", bool):
+            self.logger.info("new_game: abort move disabled (qlx_dmoverAutoMoveDefaultOnAbort=0); exiting.")
+            return
+        self.logger.info("Match aborted (new_game in warmup); scheduling move of %d tracked player(s).", tracked)
+        self._move_generation += 1
+        empty_snapshot = ([], [], [])
+        self._move_default_after_game_end(empty_snapshot, [], True, self._move_generation)
+
     def handle_game_end(self, aborted):
+        self.logger.info("game_end hook fired: aborted=%s tracked=%d", aborted, len(self.active_match_users))
         # When the relevant cvar is off we return untouched, so tracking stays intact.
         if aborted:
             if not self.get_cvar("qlx_dmoverAutoMoveDefaultOnAbort", bool):
+                self.logger.info("game_end: abort move disabled (qlx_dmoverAutoMoveDefaultOnAbort=0); exiting.")
                 return
         elif not self.get_cvar("qlx_dmoverAutoMoveDefaultOnGameEnd", bool):
+            self.logger.info("game_end: map-end move disabled (qlx_dmoverAutoMoveDefaultOnGameEnd=0); exiting.")
             return
 
         teams = self.teams()
@@ -212,11 +233,15 @@ class discord_ql_mover(minqlxtended.Plugin):
                 "Match aborted; scheduling move of %d tracked player(s) to the lobby.",
                 len(self.active_match_users),
             )
-        self._move_default_after_game_end(team_snapshot, spectator_players, aborted)
+        self._move_generation += 1
+        self._move_default_after_game_end(team_snapshot, spectator_players, aborted, self._move_generation)
 
     @minqlxtended.delay(2)
     @minqlxtended.thread
-    def _move_default_after_game_end(self, team_snapshot, spectator_players, aborted=False):
+    def _move_default_after_game_end(self, team_snapshot, spectator_players, aborted=False, generation=None):
+        if generation is not None and generation != self._move_generation:
+            self.logger.info("Default move superseded by a newer move (ready-up/abort); skipping.")
+            return
         try:
             self._do_move_default_after_game_end(team_snapshot, spectator_players, aborted)
         except Exception:
@@ -238,9 +263,18 @@ class discord_ql_mover(minqlxtended.Plugin):
             len(team_snapshot[1]), len(spectator_players), len(self.active_match_users)
         )
         discord_mappings = self._get_discord_mappings(player_ids)
+        linked = [sid for sid in player_ids if str(sid) in {str(k) for k in (discord_mappings or {})}]
+        self.logger.info(
+            "%s: %d player(s) in snapshot, %d linked to Discord, %d unlinked (expected skip); mapping keys=%s",
+            reason, len(player_ids), len(linked), len(player_ids) - len(linked), list((discord_mappings or {}).keys())
+        )
+        if not discord_mappings:
+            self.logger.warning("%s: Discord mapping lookup returned nothing; no one can be moved.", reason)
         forced_default_discord_ids = self._resolve_forced_spectator_discord_ids(
             spectator_players, discord_mappings
         )
+        self.logger.info("%s: invoking _execute_move('default') tracked=%d forced=%d",
+                         reason, len(self.active_match_users), len(forced_default_discord_ids or ()))
         self.msg("^2[DMover]^7 {}; returning tracked match players (and spectators in red/blue voice) to the default voice channel.".format(reason))
         moved_count = self._execute_move(
             "default", minqlxtended.CHAT_CHANNEL, team_snapshot, force_move_discord_ids=forced_default_discord_ids,
@@ -647,11 +681,13 @@ class discord_ql_mover(minqlxtended.Plugin):
     ):
         discord_id = discord_mappings.get(str(steam_id))
         if discord_id is None:
+            self.logger.info("Move %s: skip %s (%s): no Discord mapping.", action, player_name, steam_id)
             missing.append((player_name, steam_id))
             return
 
         force_move = action == "default" and discord_id in force_move_discord_ids
         if action == "default" and discord_id not in self.active_match_users and not force_move:
+            self.logger.info("Move default: skip %s (%s): discord %s is not tracked.", player_name, steam_id, discord_id)
             skipped_untracked.append((player_name, steam_id, discord_id))
             return
 
@@ -672,6 +708,8 @@ class discord_ql_mover(minqlxtended.Plugin):
                 return
             source_channel_check = "source_channel_matches_default"
         elif source_channel not in (str(red_channel), str(blue_channel)):
+            self.logger.info("Move default: skip %s (%s): voice channel is %s, not red/blue.",
+                             player_name, steam_id, source_channel)
             skipped_wrong_channel.append((player_name, steam_id, discord_id, source_channel, "default"))
             return
         else:
