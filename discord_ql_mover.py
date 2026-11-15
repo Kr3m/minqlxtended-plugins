@@ -217,14 +217,26 @@ class discord_ql_mover(minqlxtended.Plugin):
     @minqlxtended.delay(2)
     @minqlxtended.thread
     def _move_default_after_game_end(self, team_snapshot, spectator_players, aborted=False):
+        try:
+            self._do_move_default_after_game_end(team_snapshot, spectator_players, aborted)
+        except Exception:
+            self.logger.exception("Automatic %s move to lobby failed; tracking left intact.",
+                                  "abort" if aborted else "map-end")
+
+    def _do_move_default_after_game_end(self, team_snapshot, spectator_players, aborted=False):
         reason = "Match aborted" if aborted else "Map ended"
         config_error = self._validate_runtime_config()
         if config_error is not None:
+            self.logger.warning("Automatic move skipped (config): %s", config_error)
             self.msg("^1[DMover]^7 Automatic {} move skipped: {}".format(
                 "abort" if aborted else "map-end", config_error))
             return
 
         player_ids = [steam_id for players in team_snapshot for _, steam_id in players]
+        self.logger.info(
+            "%s: snapshot blue=%d red=%d spec=%d, tracked=%d.", reason, len(team_snapshot[0]),
+            len(team_snapshot[1]), len(spectator_players), len(self.active_match_users)
+        )
         discord_mappings = self._get_discord_mappings(player_ids)
         forced_default_discord_ids = self._resolve_forced_spectator_discord_ids(
             spectator_players, discord_mappings
@@ -557,6 +569,7 @@ class discord_ql_mover(minqlxtended.Plugin):
                 player_ids.extend(steam_id for _, steam_id in spectator_players)
             discord_mappings = self._get_discord_mappings(player_ids)
 
+        tracked_before = len(self.active_match_users)
         if action == "teams":
             self.active_match_users.clear()
 
@@ -590,11 +603,41 @@ class discord_ql_mover(minqlxtended.Plugin):
                     force_move_discord_ids, auth_diagnostics, discord_mappings
                 )
 
+        if action == "default":
+            # Tracked users no longer in a team (left, re-teamed, spectating) would otherwise be dropped unmoved.
+            seen_discord_ids = {
+                discord_mappings.get(str(steam_id))
+                for players in (blue_players, red_players, spectator_players) for _, steam_id in players
+            }
+            leftovers = sorted(self.active_match_users - seen_discord_ids)
+            if leftovers:
+                self.logger.info("Move default: %d tracked user(s) not in team snapshot; moving them too.", len(leftovers))
+                extra_mappings = dict(discord_mappings)
+                for discord_id in leftovers:
+                    key = "tracked:{}".format(discord_id)
+                    extra_mappings[key] = discord_id
+                    self._move_player(
+                        action, "tracked-user", key, guild_id, token, default_channel, default_channel, red_channel,
+                        blue_channel, dry_run, moved, missing, failed, skipped_untracked, skipped_wrong_channel,
+                        force_move_discord_ids, auth_diagnostics, extra_mappings
+                    )
+
+        self.logger.info(
+            "Move %s: snapshot blue=%d red=%d spec=%d tracked_before=%d | moved=%d missing=%d "
+            "skipped_untracked=%d skipped_wrong_channel=%d failed=%d",
+            action, len(blue_players), len(red_players), len(spectator_players), tracked_before, len(moved),
+            len(missing), len(skipped_untracked), len(skipped_wrong_channel), len(failed),
+        )
         self._report_move_result(
             action, channel, moved, missing, failed, skipped_untracked, skipped_wrong_channel, dry_run
         )
         if action == "default":
-            self.active_match_users.clear()
+            # Only forget users once everyone was handled; failed ones stay tracked for a retry.
+            if failed:
+                self.logger.warning("Move default: %d failure(s); keeping tracking for retry.", len(failed))
+            else:
+                self.active_match_users.clear()
+                self.logger.info("Move default: tracking cleared.")
         return len(moved)
 
     def _move_player(
