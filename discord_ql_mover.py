@@ -46,6 +46,7 @@ class discord_ql_mover(minqlxtended.Plugin):
         self.set_cvar_once("qlx_dmoverSteamApiKey", "")
         self.set_cvar_once("qlx_dmoverAutoMoveTeamsOnCountdown", "1")
         self.set_cvar_once("qlx_dmoverAutoMoveDefaultOnGameEnd", "1")
+        self.set_cvar_once("qlx_dmoverAutoMoveDefaultOnAbort", "1")
         self.set_cvar_once("qlx_dmoverAutoMoveTeamsMinInterval", "20")
 
         self.add_command(("move", "dmove"), self.cmd_move, usage="<teams|default>")
@@ -114,34 +115,53 @@ class discord_ql_mover(minqlxtended.Plugin):
         timeout_seconds = self.get_cvar("qlx_dmoverRequestTimeoutSeconds", float)
         try:
             with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+                status = response.status
                 body = response.read(65537)
-            if len(body) > 65536:
-                self.logger.warning("Fragdex Discord token fetch failed: response was too large.")
-                return
-            payload = json.loads(body.decode("utf-8"))
-            token = payload.get("token") if isinstance(payload, dict) else None
-            if not isinstance(token, str):
-                self.logger.warning("Fragdex Discord token fetch failed: response did not contain a token.")
-                return
-            token = self._normalize_discord_bot_token(token or "")
-            if not token:
-                self.logger.warning("Fragdex Discord token fetch failed: response did not contain a token.")
-                return
         except urllib.error.HTTPError as error:
-            self.logger.warning("Fragdex Discord token fetch failed: HTTP %s.", error.code)
+            hints = {
+                401: "API key missing or invalid",
+                403: "check key permission, state, expiry, and allowed IPs",
+                404: "check Fragdex URL and endpoint",
+                429: "API key rate limit exceeded",
+                503: "Fragdex Discord token may not be configured",
+            }
+            self.logger.warning(
+                "Fragdex Discord token fetch failed: HTTP %s (%s).",
+                error.code, hints.get(error.code, "check Fragdex and proxy logs"),
+            )
             return
         except urllib.error.URLError as error:
             self.logger.warning("Fragdex Discord token fetch failed: network error: %s.", error.reason)
             return
-        except (UnicodeDecodeError, ValueError):
-            self.logger.warning("Fragdex Discord token fetch failed: invalid JSON response.")
-            return
-        except OSError as error:
+        except (OSError, ValueError) as error:
             self.logger.warning("Fragdex Discord token fetch failed: request error: %s.", error)
             return
 
+        if len(body) > 65536:
+            self.logger.warning("Fragdex Discord token fetch failed: HTTP %s, response was too large.", status)
+            return
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self.logger.warning("Fragdex Discord token fetch failed: HTTP %s, invalid JSON response.", status)
+            return
+        token = payload.get("token") if isinstance(payload, dict) else None
+        if not isinstance(token, str):
+            self.logger.warning(
+                "Fragdex Discord token fetch failed: HTTP %s, top-level token is missing or not a string.", status
+            )
+            return
+        normalized_token = self._normalize_discord_bot_token(token)
+        normalized = normalized_token != token
+        token = normalized_token
+        if not token:
+            self.logger.warning(
+                "Fragdex Discord token fetch failed: HTTP %s, token is empty after normalization.", status
+            )
+            return
+
         self._cached_discord_bot_token = token
-        self.logger.info("Obtained Discord bot token from Fragdex.")
+        self.logger.info("Obtained Discord bot token from Fragdex: HTTP %s, normalized=%s.", status, normalized)
 
     # ---------- Commands ----------
     def handle_game_countdown(self):
@@ -173,9 +193,11 @@ class discord_ql_mover(minqlxtended.Plugin):
         return now >= self._last_auto_teams_move_ts + min_interval
 
     def handle_game_end(self, aborted):
+        # When the relevant cvar is off we return untouched, so tracking stays intact.
         if aborted:
-            return
-        if not self.get_cvar("qlx_dmoverAutoMoveDefaultOnGameEnd", bool):
+            if not self.get_cvar("qlx_dmoverAutoMoveDefaultOnAbort", bool):
+                return
+        elif not self.get_cvar("qlx_dmoverAutoMoveDefaultOnGameEnd", bool):
             return
 
         teams = self.teams()
@@ -185,14 +207,21 @@ class discord_ql_mover(minqlxtended.Plugin):
             [(player.clean_name, str(player.steam_id)) for player in teams.get("red", [])],
             spectator_players,
         )
-        self._move_default_after_game_end(team_snapshot, spectator_players)
+        if aborted:
+            self.logger.info(
+                "Match aborted; scheduling move of %d tracked player(s) to the lobby.",
+                len(self.active_match_users),
+            )
+        self._move_default_after_game_end(team_snapshot, spectator_players, aborted)
 
     @minqlxtended.delay(2)
     @minqlxtended.thread
-    def _move_default_after_game_end(self, team_snapshot, spectator_players):
+    def _move_default_after_game_end(self, team_snapshot, spectator_players, aborted=False):
+        reason = "Match aborted" if aborted else "Map ended"
         config_error = self._validate_runtime_config()
         if config_error is not None:
-            self.msg("^1[DMover]^7 Automatic map-end move skipped: {}".format(config_error))
+            self.msg("^1[DMover]^7 Automatic {} move skipped: {}".format(
+                "abort" if aborted else "map-end", config_error))
             return
 
         player_ids = [steam_id for players in team_snapshot for _, steam_id in players]
@@ -200,11 +229,13 @@ class discord_ql_mover(minqlxtended.Plugin):
         forced_default_discord_ids = self._resolve_forced_spectator_discord_ids(
             spectator_players, discord_mappings
         )
-        self.msg("^2[DMover]^7 Map ended; returning tracked match players (and spectators in red/blue voice) to the default voice channel.")
-        self._execute_move(
+        self.msg("^2[DMover]^7 {}; returning tracked match players (and spectators in red/blue voice) to the default voice channel.".format(reason))
+        moved_count = self._execute_move(
             "default", minqlxtended.CHAT_CHANNEL, team_snapshot, force_move_discord_ids=forced_default_discord_ids,
             discord_mappings=discord_mappings
         )
+        if aborted:
+            self.logger.info("Match aborted; moved %d player(s) to the lobby.", moved_count or 0)
 
     def cmd_move(self, player, msg, channel):
         if not self._require_permission(player, channel):
@@ -564,6 +595,7 @@ class discord_ql_mover(minqlxtended.Plugin):
         )
         if action == "default":
             self.active_match_users.clear()
+        return len(moved)
 
     def _move_player(
         self, action, player_name, steam_id, guild_id, token, target_channel, default_channel, red_channel,
