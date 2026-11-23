@@ -11,6 +11,8 @@ then the original attempt is blocked. Native validation and vote text are preser
 maps. Other vote names are left alone. Use /callvote map <mapname> to avoid ambiguity
 with custom votes whose names happen to match installed maps.
 Map-vote arguments also tolerate a redundant leading "map" keyword.
+Diagnostic INFO logs record hook entry, parsing, resolution, command delivery,
+active-vote state and the final STOP_ALL return; delivery alone is not acceptance.
 
 Enabled behavior (!map <mapname> [factory]):
   1) If [factory] is explicitly provided, use it.
@@ -101,13 +103,19 @@ class mymaps(minqlx.Plugin):
             usage="<mapname> [factory]",
         )
         self.add_hook("vote_called", self.handle_vote_called)
+        self.logger.info("mymaps diagnostics ready: vote_called hook registered.")
 
     def handle_vote_called(self, caller, vote, args):
+        # Diagnostic 1: raw hook inputs, before every early return.
         self.logger.info(
-            f"vote_called: vote={vote!r} args={args!r} caller={caller.name if caller else 'server'}"
+            f"vote_called ENTER: vote={vote!r} args={args!r} caller={caller.name if caller else 'server'}"
         )
         # Native callvote detection; reissued commands must not recurse into resolution.
-        if self._reissuing_vote or not self._vote_feature_enabled():
+        if self._reissuing_vote:
+            self.logger.info("vote_called SKIP: reissued command; recursion guard active.")
+            return
+        if not self._vote_feature_enabled():
+            self.logger.info("vote_called SKIP: qlx_mymaps_vote_enable is disabled.")
             return
         if caller is None:
             self.logger.warning("Map vote resolution requires a player caller; leaving vote unchanged.")
@@ -122,14 +130,17 @@ class mymaps(minqlx.Plugin):
         elif not parts and self._is_map_vote_shorthand(vote_name):
             parts = [vote_name]
         else:
+            self.logger.info("vote_called SKIP: not a recognized map vote.")
             return
         if len(parts) not in (1, 2):
             self.logger.warning("Map vote has unexpected arguments %r; leaving it unchanged.", args)
             return
         map_name = parts[0]
         explicit_factory = parts[1] if len(parts) == 2 else None
+        self.logger.info("Map vote parsed: map=%r explicit_factory=%r.", map_name, explicit_factory)
         # Reuse !map's priority chain, but fail open when the pool cannot be read.
         factory, rule = self._resolve_factory_details(map_name, explicit_factory, require_pool=True)
+        self.logger.info("Map vote resolved: map=%r factory=%r rule=%r.", map_name, factory, rule)
         if not factory:
             self.logger.warning("Map vote '%s': no factory resolved; rewritten=no.", map_name)
             return
@@ -167,9 +178,15 @@ class mymaps(minqlx.Plugin):
             return
 
         command = f"callvote map {map_name} {factory}"
+        self.logger.info(
+            "Vote rewrite context: g_voteFlags=%r qlx_enforceMappool=%r.",
+            flags, self._read_cvar("qlx_enforceMappool")
+        )
         self._reissuing_vote = True
         try:
-            if self._try_vote_command(caller, command):
+            # Diagnostic 2: immediately before attempting the rewritten command.
+            self.logger.info(f"REWRITING vote: map={map_name!r} factory={factory!r}")
+            if self._try_vote_command(caller, command, is_rewrite=True):
                 self.logger.info(
                     "Map vote '%s': %s factory '%s'; rewritten=yes.", map_name, rule, factory
                 )
@@ -184,18 +201,29 @@ class mymaps(minqlx.Plugin):
                     self.logger.error("Original vote replay also failed: %r.", original)
         finally:
             self._reissuing_vote = False
+        self.logger.info("vote_called EXIT: returning STOP_ALL after rewrite/replay.")
         return STOP_ALL
 
-    def _try_vote_command(self, caller, command):
+    def _try_vote_command(self, caller, command, *, is_rewrite=False):
+        delivered = None
         try:
             delivered = minqlx.client_command(caller.id, command)
+            # Diagnostic 3: command returned without raising; QL may still have rejected it.
+            if is_rewrite:
+                self.logger.info("REWRITE client_command sent")
+            else:
+                self.logger.info("Original vote replay client_command sent")
         except (ValueError, TypeError, RuntimeError) as exc:
             self.logger.error("Vote command %r failed: %s.", command, exc)
         else:
             if not delivered:
                 self.logger.error("Vote command %r was not delivered.", command)
         # client_command reports delivery, not QL acceptance. A new active vote is observable.
-        return self.is_vote_active()
+        active = self.is_vote_active()
+        self.logger.info(
+            "Vote command result: command=%r delivered=%r active=%r.", command, delivered, active
+        )
+        return active
 
     def _is_map_vote_shorthand(self, vote):
         if not re.fullmatch(r"[A-Za-z0-9_./-]+", vote):

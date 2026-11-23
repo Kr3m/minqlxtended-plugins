@@ -81,12 +81,12 @@ class TestMapVotes(unittest.TestCase):
         self.plugin.add_hook.assert_called_once_with("vote_called", self.plugin.handle_vote_called)
         self.plugin.cvars["qlx_mymaps_vote_enable"] = "0"
         self.call("", "realmofsteelrats")
-        self.plugin.logger.info.assert_called_with(
-            "vote_called: vote='realmofsteelrats' args='' caller=Player"
+        self.plugin.logger.info.assert_any_call(
+            "vote_called ENTER: vote='realmofsteelrats' args='' caller=Player"
         )
         self.plugin.handle_vote_called(None, "map", "realmofsteelrats")
-        self.plugin.logger.info.assert_called_with(
-            "vote_called: vote='map' args='realmofsteelrats' caller=server"
+        self.plugin.logger.info.assert_any_call(
+            "vote_called ENTER: vote='map' args='realmofsteelrats' caller=server"
         )
         self.assertEqual(self.commands, [])
 
@@ -97,10 +97,44 @@ class TestMapVotes(unittest.TestCase):
                 self.commands.clear()
                 self.assertEqual(self.call(args, vote), self.module.STOP_ALL)
                 self.assertEqual(self.commands, ["callvote map realmofsteelrats vft"])
-                self.plugin.logger.info.assert_called_with(
+                self.plugin.logger.info.assert_any_call(
                     "Map vote '%s': %s factory '%s'; rewritten=yes.",
                     "realmofsteelrats", "pool", "vft"
                 )
+
+    def test_rewrite_diagnostics_bracket_actual_command_and_report_stop(self):
+        events = []
+        self.plugin.logger.info.side_effect = lambda message, *args: events.append(message)
+
+        def execute(caller_id, command):
+            events.append("COMMAND entered")
+            result = self.execute(caller_id, command)
+            events.append("COMMAND returned")
+            return result
+
+        self.module.minqlx.client_command.side_effect = execute
+        self.assertEqual(self.call("realmofsteelrats"), self.module.STOP_ALL)
+        before = "REWRITING vote: map='realmofsteelrats' factory='vft'"
+        self.assertLess(events.index(before), events.index("COMMAND entered"))
+        self.assertLess(events.index("COMMAND returned"), events.index("REWRITE client_command sent"))
+        self.assertEqual(events[-1], "vote_called EXIT: returning STOP_ALL after rewrite/replay.")
+        self.plugin.logger.info.assert_any_call(
+            "Vote command result: command=%r delivered=%r active=%r.",
+            "callvote map realmofsteelrats vft", True, True
+        )
+
+    def test_failed_rewrite_does_not_log_successful_send(self):
+        def execute(caller_id, command):
+            if command.endswith(" vft"):
+                raise RuntimeError("command failed")
+            return self.execute(caller_id, command)
+
+        self.module.minqlx.client_command.side_effect = execute
+        self.assertEqual(self.call("realmofsteelrats"), self.module.STOP_ALL)
+        messages = [entry.args[0] for entry in self.plugin.logger.info.call_args_list]
+        self.assertNotIn("REWRITE client_command sent", messages)
+        self.assertIn("Original vote replay client_command sent", messages)
+        self.assertEqual(self.commands, ["callvote map realmofsteelrats"])
 
     def test_default_and_current_for_canonical_and_installed_shorthand(self):
         self.module.minqlx.map_info.return_value = SimpleNamespace(name="unlisted")
