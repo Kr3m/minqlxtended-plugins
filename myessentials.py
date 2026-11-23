@@ -177,7 +177,8 @@ class myessentials(iouonegirlPlugin):
                 return minqlxtended.Return.STOP_ALL
 
             map_name = split_args[0].lower()
-            factory = split_args[1] if len(split_args) > 1 else self.game.factory
+            # Validate explicit factories only; mymaps or native QL resolves omitted ones.
+            factory = split_args[1] if len(split_args) > 1 else None
             if map_name in self.mappool:
                 if factory and factory not in self.mappool[map_name]:
                     caller.tell("This factory is not allowed on that map. Use {}mappool to see available options."

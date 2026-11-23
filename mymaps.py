@@ -30,7 +30,8 @@ Install / load notes
 --------------------
 - This plugin registers "map"/"changemap" at PRI_HIGHEST and returns RET_STOP_ALL after handling.
   That gives it precedence over lower-priority handlers, including essentials.
-- Keep essentials loaded for all other commands/features.
+- Keep essentials or its replacement myessentials loaded for other commands/features.
+  Do not load both: myessentials automatically unloads essentials.
 - If another plugin also registers !map at PRI_HIGHEST, load order between those two will matter.
   Unload that competing override (including a separate map.py), or load mymaps first.
 - Supports minqlx and minqlxtended; add_command is the command-registration API,
