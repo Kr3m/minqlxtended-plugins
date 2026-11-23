@@ -82,11 +82,11 @@ class TestMapVotes(unittest.TestCase):
         self.plugin.cvars["qlx_mymaps_vote_enable"] = "0"
         self.call("", "realmofsteelrats")
         self.plugin.logger.info.assert_called_with(
-            "vote_called fired: vote='realmofsteelrats' args='' caller=Player"
+            "vote_called: vote='realmofsteelrats' args='' caller=Player"
         )
         self.plugin.handle_vote_called(None, "map", "realmofsteelrats")
         self.plugin.logger.info.assert_called_with(
-            "vote_called fired: vote='map' args='realmofsteelrats' caller=server"
+            "vote_called: vote='map' args='realmofsteelrats' caller=server"
         )
         self.assertEqual(self.commands, [])
 
@@ -222,6 +222,36 @@ class TestMapVotes(unittest.TestCase):
     def test_case_and_whitespace(self):
         self.assertEqual(self.call(" \tREALMOFSTEELRATS  ", "MAP"), self.module.STOP_ALL)
         self.assertEqual(self.commands, ["callvote map REALMOFSTEELRATS vft"])
+
+    def test_redundant_map_keyword_and_whitespace_are_normalized(self):
+        for vote, args in [
+            ("map", "map realmofsteelrats"),
+            (" \tMAP ", " \tMaP  REALMOFSTEELRATS \t"),
+            (" realmofsteelrats ", " \t"),
+        ]:
+            with self.subTest(vote=vote, args=args):
+                self.plugin.vote_active = False
+                self.commands.clear()
+                self.assertEqual(self.call(args, vote), self.module.STOP_ALL)
+                self.assertEqual(len(self.commands), 1)
+                self.assertEqual(
+                    self.commands[0].lower(), "callvote map realmofsteelrats vft"
+                )
+
+    def test_redundant_map_keyword_keeps_explicit_factory_untouched(self):
+        self.assertIsNone(self.call(" MAP realmofsteelrats ft_duel ", " map "))
+        self.assertEqual(self.commands, [])
+        self.plugin.logger.info.assert_called_with(
+            "Map vote '%s': %s factory '%s'; rewritten=no.",
+            "realmofsteelrats", "explicit", "ft_duel"
+        )
+
+    def test_missing_map_after_keyword_and_extra_arguments_are_untouched(self):
+        for args in ("map", " MAP ", "map realmofsteelrats ca extra"):
+            with self.subTest(args=args):
+                self.assertIsNone(self.call(args))
+        self.assertEqual(self.commands, [])
+        self.plugin.logger.warning.assert_called()
 
 
 class TestLegacyMapVotes(TestMapVotes):

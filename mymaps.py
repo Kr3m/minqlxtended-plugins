@@ -10,6 +10,7 @@ then the original attempt is blocked. Native validation and vote text are preser
 /callvote <mapname> is also supported for pool maps and, on minqlxtended, installed
 maps. Other vote names are left alone. Use /callvote map <mapname> to avoid ambiguity
 with custom votes whose names happen to match installed maps.
+Map-vote arguments also tolerate a redundant leading "map" keyword.
 
 Enabled behavior (!map <mapname> [factory]):
   1) If [factory] is explicitly provided, use it.
@@ -103,7 +104,7 @@ class mymaps(minqlx.Plugin):
 
     def handle_vote_called(self, caller, vote, args):
         self.logger.info(
-            f"vote_called fired: vote={vote!r} args={args!r} caller={caller.name if caller else 'server'}"
+            f"vote_called: vote={vote!r} args={args!r} caller={caller.name if caller else 'server'}"
         )
         # Native callvote detection; reissued commands must not recurse into resolution.
         if self._reissuing_vote or not self._vote_feature_enabled():
@@ -112,10 +113,14 @@ class mymaps(minqlx.Plugin):
             self.logger.warning("Map vote resolution requires a player caller; leaving vote unchanged.")
             return
 
-        if vote.lower() == "map":
-            parts = args.split()
-        elif not args.strip() and self._is_map_vote_shorthand(vote):
-            parts = [vote]
+        vote_name = vote.strip()
+        parts = args.split()
+        if vote_name.lower() == "map":
+            # Native args omit "map"; tolerate a redundant keyword from other callers.
+            if parts and parts[0].lower() == "map":
+                parts = parts[1:]
+        elif not parts and self._is_map_vote_shorthand(vote_name):
+            parts = [vote_name]
         else:
             return
         if len(parts) not in (1, 2):
