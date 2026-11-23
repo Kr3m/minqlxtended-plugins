@@ -5,10 +5,11 @@ Purpose
 -------
 Overrides !map <mapname> [factory] to support map-pool-aware factory selection when enabled.
 For native /callvote map votes, an independent toggle enables the same selection.
-The native vote starts unchanged; after it starts, its execution command is updated.
-The displayed vote text remains unchanged, and native callvote validation does not
-validate the added factory.
-Votes that start and end between frame polls may not be updated.
+Votes without a factory are reissued as player commands with the resolved factory,
+then the original attempt is blocked. Native validation and vote text are preserved.
+/callvote <mapname> is also supported for pool maps and, on minqlxtended, installed
+maps. Other vote names are left alone. Use /callvote map <mapname> to avoid ambiguity
+with custom votes whose names happen to match installed maps.
 
 Enabled behavior (!map <mapname> [factory]):
   1) If [factory] is explicitly provided, use it.
@@ -35,11 +36,15 @@ Install / load notes
   Absolute pool paths are supported. Parsed pools are cached by path and stat fingerprint;
   edits are picked up on the next command, without reloading the plugin.
 - !map factory IDs are passed through to QL for validation, including qlx_defaultFactory.
-- Callvote resolution requires minqlxtended's writable level.vote_string and vote_started
-  hook. Legacy minqlx retains !map support but does not get this callvote feature.
-- g_voteFlags bit 8 may prohibit factory arguments in native map votes. This plugin
-  leaves explicit arguments to QL and warns when it adds a factory under that flag;
-  updating the started vote bypasses QL's factory-argument check.
+- Callvote uses vote_called, client_command and is_vote_active on either framework.
+  Shorthand for unlisted maps additionally requires minqlxtended's map_info API.
+- g_voteFlags bit 8 may prohibit factory arguments in native map votes. Rewriting is
+  skipped with a warning when set (or when flags cannot be read). An administrator
+  must clear that bit to enable rewriting; explicit factories are left to QL.
+- Missing/unreadable pools leave votes unchanged. Rejected rewrites are logged and
+  the original command is replayed once, without further rewriting. This fallback
+  is best-effort: native validation, other plugins or a disconnected caller can
+  still reject it. client_command's return value alone does not confirm acceptance.
 
 Custom Cvars
 ------------
@@ -67,12 +72,10 @@ except ModuleNotFoundError as exc:
     HIGHEST = minqlx.PRI_HIGHEST
     STOP_ALL = minqlx.RET_STOP_ALL
     USAGE = minqlx.RET_USAGE
-    EXTENDED = False
 else:
     HIGHEST = minqlx.Priority.HIGHEST
     STOP_ALL = minqlx.Return.STOP_ALL
     USAGE = minqlx.Return.USAGE
-    EXTENDED = True
 
 
 class mymaps(minqlx.Plugin):
@@ -87,8 +90,7 @@ class mymaps(minqlx.Plugin):
         self._cached_pool_path = None
         self._cached_pool_stamp = None
         self._cached_pool_data = None
-        self._pending_map_vote = None
-        self._pending_vote_frame_seen = False
+        self._reissuing_vote = False
 
         self.add_command(
             ("map", "changemap"),
@@ -97,96 +99,116 @@ class mymaps(minqlx.Plugin):
             priority=HIGHEST,
             usage="<mapname> [factory]",
         )
-        if EXTENDED and hasattr(minqlx, "level"):
-            self.add_hook("vote_called", self.handle_vote_called)
-            self.add_hook("vote_started", self.handle_vote_started)
-        else:
-            self.logger.warning("Map vote resolution requires minqlxtended's level API.")
+        self.add_hook("vote_called", self.handle_vote_called)
 
     def handle_vote_called(self, caller, vote, args):
-        # Detection occurs before native validation; never cancel the original vote.
-        if self._pending_map_vote and self.is_vote_active():
+        self.logger.info(
+            f"vote_called fired: vote={vote!r} args={args!r} caller={caller.name if caller else 'server'}"
+        )
+        # Native callvote detection; reissued commands must not recurse into resolution.
+        if self._reissuing_vote or not self._vote_feature_enabled():
             return
-        self._clear_pending_vote()
-        if vote.lower() != "map" or not self._vote_feature_enabled():
+        if caller is None:
+            self.logger.warning("Map vote resolution requires a player caller; leaving vote unchanged.")
             return
 
-        parts = args.split()
+        if vote.lower() == "map":
+            parts = args.split()
+        elif not args.strip() and self._is_map_vote_shorthand(vote):
+            parts = [vote]
+        else:
+            return
         if len(parts) not in (1, 2):
             self.logger.warning("Map vote has unexpected arguments %r; leaving it unchanged.", args)
             return
         map_name = parts[0]
         explicit_factory = parts[1] if len(parts) == 2 else None
-        # The shared resolver preserves !map's priority; votes require a readable pool.
+        # Reuse !map's priority chain, but fail open when the pool cannot be read.
         factory, rule = self._resolve_factory_details(map_name, explicit_factory, require_pool=True)
         if not factory:
-            self.logger.warning("Map vote '%s': no factory resolved; leaving it unchanged.", map_name)
+            self.logger.warning("Map vote '%s': no factory resolved; rewritten=no.", map_name)
             return
         if explicit_factory:
             self.logger.info("Map vote '%s': %s factory '%s'; rewritten=no.", map_name, rule, factory)
             return
         if not all(re.fullmatch(r"[A-Za-z0-9_./-]+", value) for value in (map_name, factory)):
-            self.logger.warning("Map vote '%s': unsafe map or factory; leaving it unchanged.", map_name)
-            return
-
-        flags = self._read_cvar("g_voteFlags")
-        try:
-            if flags and int(flags) & 8:
-                self.logger.warning(
-                    "Map vote '%s': g_voteFlags bit 8 may prohibit native factory arguments; "
-                    "updating the started vote bypasses that check.", map_name
-                )
-        except ValueError:
-            self.logger.warning("Invalid g_voteFlags value %r; cannot check bit 8.", flags)
-
-        self.add_hook("frame", self._expire_pending_vote)
-        self._pending_map_vote = (caller.id, map_name, factory, rule)
-        self._pending_vote_frame_seen = False
-
-    def handle_vote_started(self, caller, vote, args):
-        pending = self._pending_map_vote
-        if not pending:
-            return
-        self._clear_pending_vote()
-        caller_id, map_name, factory, rule = pending
-        parts = args.split()
-        if (
-            caller is None or caller.id != caller_id or vote.lower() != "map"
-            or len(parts) not in (1, 2) or parts[0].lower() != map_name.lower()
-        ):
-            self.logger.warning("Map vote '%s': started vote did not match; rewritten=no.", map_name)
-            return
-
-        try:
-            level = minqlx.level
-            original = level.vote_string
-            if original.split() != [vote, *parts] or not level.vote_time:
-                self.logger.warning("Map vote '%s': execution command changed; rewritten=no.", map_name)
-                return
-            level.vote_string = f"map {map_name} {factory}"
-        except (minqlx.EngineStateError, ValueError, TypeError, RuntimeError) as exc:
-            # A failed assignment leaves the original native vote in place.
-            self.logger.error("Map vote '%s': rewrite failed (%s); rewritten=no.", map_name, exc)
-            return
-        self.logger.info("Map vote '%s': %s factory '%s'; rewritten=yes.", map_name, rule, factory)
-
-    def _expire_pending_vote(self):
-        if self._pending_map_vote is None:
-            return
-        if self._pending_vote_frame_seen:
-            _, map_name, factory, rule = self._pending_map_vote
             self.logger.warning(
-                "Map vote '%s': %s factory '%s'; vote not observed starting, rewritten=no.",
+                "Map vote '%s': %s factory %r is unsafe for reissuance; rewritten=no.",
                 map_name, rule, factory
             )
-            self._clear_pending_vote()
-        else:
-            self._pending_vote_frame_seen = True
+            return
 
-    def _clear_pending_vote(self):
-        if self._pending_map_vote is not None:
-            self._pending_map_vote = None
-            self.remove_hook("frame", self._expire_pending_vote)
+        flags = self._read_cvar("g_voteFlags", None)
+        try:
+            factory_votes_disabled = bool(int(flags) & 8)
+        except (ValueError, TypeError):
+            self.logger.warning(
+                "Map vote '%s': %s factory '%s'; cannot read g_voteFlags %r, rewritten=no.",
+                map_name, rule, factory, flags
+            )
+            return
+        if factory_votes_disabled:
+            self.logger.warning(
+                "Map vote '%s': %s factory '%s'; g_voteFlags bit 8 is set. "
+                "Clear bit 8 to allow factory rewriting; rewritten=no.",
+                map_name, rule, factory
+            )
+            return
+        if self.is_vote_active():
+            self.logger.info(
+                "Map vote '%s': %s factory '%s'; another vote is active, rewritten=no.",
+                map_name, rule, factory
+            )
+            return
+
+        command = f"callvote map {map_name} {factory}"
+        self._reissuing_vote = True
+        try:
+            if self._try_vote_command(caller, command):
+                self.logger.info(
+                    "Map vote '%s': %s factory '%s'; rewritten=yes.", map_name, rule, factory
+                )
+            else:
+                # Nested client_command replaces engine tokens: replay, then block the outer call.
+                self.logger.error(
+                    "Map vote '%s': %s factory '%s'; rewrite rejected, rewritten=no. "
+                    "Replaying original vote.", map_name, rule, factory
+                )
+                original = f"callvote {vote}" + (f" {args}" if args else "")
+                if not self._try_vote_command(caller, original):
+                    self.logger.error("Original vote replay also failed: %r.", original)
+        finally:
+            self._reissuing_vote = False
+        return STOP_ALL
+
+    def _try_vote_command(self, caller, command):
+        try:
+            delivered = minqlx.client_command(caller.id, command)
+        except (ValueError, TypeError, RuntimeError) as exc:
+            self.logger.error("Vote command %r failed: %s.", command, exc)
+        else:
+            if not delivered:
+                self.logger.error("Vote command %r was not delivered.", command)
+        # client_command reports delivery, not QL acceptance. A new active vote is observable.
+        return self.is_vote_active()
+
+    def _is_map_vote_shorthand(self, vote):
+        if not re.fullmatch(r"[A-Za-z0-9_./-]+", vote):
+            return False
+        pool = self._parse_map_pool()
+        if pool is None:
+            return False
+        if vote.lower() in pool:
+            return True
+        map_info = getattr(minqlx, "map_info", None)
+        if map_info is None:
+            self.logger.debug("Cannot identify bare vote %r as a map; use /callvote map <mapname>.", vote)
+            return False
+        try:
+            return map_info(vote) is not None
+        except (OSError, ValueError, RuntimeError) as exc:
+            self.logger.warning("Could not identify bare map vote %r: %s.", vote, exc)
+            return False
 
     def cmd_map(self, player, msg, channel):
         if len(msg) < 2:
