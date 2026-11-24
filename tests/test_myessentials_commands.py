@@ -149,30 +149,49 @@ class TestMyessentialsCommands(unittest.TestCase):
         cls, self.framework = load_plugins()
         self.plugin = cls.__new__(cls)
         self.plugin.game = FakeGame(self.plugin)
-        self.red = FakePlayer(3, "RedGuy", team="red")
+        # Mirrors the field report: "!switch 1 3" was declared ambiguous because
+        # "Kr3m" (slot 6) also contains the substring "3".
+        self.caller = FakePlayer(1, "Admin", team="blue")
+        self.silver = FakePlayer(3, "Silver?!?!", team="red")
+        self.kr3m = FakePlayer(6, "Kr3m", team="blue")
         self.blue = FakePlayer(7, "BlueGuy", team="blue")
         self.blue2 = FakePlayer(9, "BlueMate", team="blue")
-        FakePlugin.roster = [self.red, self.blue, self.blue2]
-        self.caller = FakePlayer(0, "Admin")
+        FakePlugin.roster = [self.caller, self.silver, self.kr3m, self.blue, self.blue2]
         self.channel = Mock()
 
-    def test_spec_by_numeric_id(self):
+    def test_spec_by_numeric_id_beats_name_substring(self):
         self.plugin.cmd_spectate(self.caller, ["!spec", "3"], self.channel)
-        self.assertEqual(self.red.team, "spectator")
+        self.assertEqual(self.silver.team, "spectator")
+        self.assertEqual(self.kr3m.team, "blue")
+        self.assertFalse(any("players matched for" in m for m in self.caller.told))
 
     def test_spec_by_name_still_works(self):
         self.plugin.cmd_spectate(self.caller, ["!spec", "bluegu"], self.channel)
         self.assertEqual(self.blue.team, "spectator")
 
+    def test_ambiguous_name_still_lists_alternatives(self):
+        result = self.plugin.cmd_spectate(self.caller, ["!spec", "blue"], self.channel)
+        self.assertEqual(result, self.framework.Return.STOP_EVENT)
+        self.assertTrue(any("players matched for" in m for m in self.caller.told))
+        self.assertEqual(self.blue.team, "blue")
+        self.assertEqual(self.blue2.team, "blue")
+
     def test_spec_nonexistent_id_fails_with_message(self):
-        result = self.plugin.cmd_spectate(self.caller, ["!spec", "31"], self.channel)
+        result = self.plugin.cmd_spectate(self.caller, ["!spec", "44"], self.channel)
         self.assertEqual(result, self.framework.Return.STOP_EVENT)
         self.assertTrue(any("no players matched" in m for m in self.caller.told))
-        self.assertEqual(self.red.team, "red")
+        self.assertEqual(self.silver.team, "red")
+
+    def test_empty_slot_digit_falls_back_to_name_match(self):
+        elite = FakePlayer(5, "31337", team="red")
+        FakePlugin.roster.append(elite)
+        self.plugin.cmd_spectate(self.caller, ["!spec", "31"], self.channel)
+        self.assertEqual(elite.team, "spectator")
 
     def test_switch_by_numeric_ids(self):
-        self.plugin.cmd_switch(self.caller, ["!switch", "3", "7"], self.channel)
-        self.assertEqual((self.red.team, self.blue.team), ("blue", "red"))
+        self.plugin.cmd_switch(self.caller, ["!switch", "1", "3"], self.channel)
+        self.assertEqual((self.caller.team, self.silver.team), ("red", "blue"))
+        self.assertFalse(any("players matched for" in m for m in self.caller.told))
 
     def test_switch_same_team_replies_instead_of_raising(self):
         result = self.plugin.cmd_switch(self.caller, ["!switch", "7", "9"], self.channel)
@@ -189,7 +208,7 @@ class TestMyessentialsCommands(unittest.TestCase):
             [
                 ("shuffle",),
                 ("slay", self.blue),
-                ("slap", self.red, 25),
+                ("slap", self.silver, 25),
                 ("lock", "red"),
             ],
         )

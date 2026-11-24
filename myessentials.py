@@ -146,13 +146,38 @@ class myessentials(iouonegirlPlugin):
             pass
 
     def find_by_name_or_id(self, player, target):
-        # COMPAT: minqlxtended's Plugin.player() raises NonexistentPlayerError for an
-        # empty client slot, but the iouonegirl superclass only expects ValueError there,
-        # so e.g. "!spec 31" with slot 31 empty died silently. Catch it here so a bad
-        # numeric ID fails with a message. Name and ID matching are otherwise unchanged.
+        # legacy: a bare integer is a client ID and resolves before any name matching,
+        # like stock essentials. The iouonegirl resolver merges the ID hit into the
+        # name-substring matches and then bails out as "ambiguous", so "!switch 1 3"
+        # listed alternatives (e.g. "Kr3m" also contains "3") instead of acting.
+        if target.isdigit() and 0 <= int(target) < 64:
+            try:
+                return self.player(int(target))
+            except minqlxtended.NonexistentPlayerError:
+                # Empty slot: fall back to the superclass' name/substring behavior.
+                matches = []
+                for p in self.find_player(target):
+                    if p not in matches:
+                        matches.append(p)
+                if not matches:
+                    player.tell("Sorry, but no players matched your tokens: {}.".format(target))
+                    return None
+                if len(matches) > 1:
+                    player.tell("A total of ^6{}^7 players matched for {}:".format(len(matches), target))
+                    out = ""
+                    for p in matches:
+                        out += "  {}^6:^7 {}\n".format(p.id, p.name)
+                    player.tell(out[:-1])
+                    return None
+                return matches.pop()
+
+        # Names, partial names and the id:X syntax keep the superclass behavior,
+        # including the "A total of N players matched" disambiguation.
         try:
             return super().find_by_name_or_id(player, target)
         except minqlxtended.NonexistentPlayerError:
+            # COMPAT: minqlxtended's Plugin.player() raises NonexistentPlayerError for
+            # an empty client slot, but the superclass only expects ValueError there.
             player.tell("Sorry, but no players matched your tokens: {}.".format(target))
             return None
 
