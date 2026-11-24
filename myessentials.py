@@ -145,6 +145,17 @@ class myessentials(iouonegirlPlugin):
         except Exception as e:
             pass
 
+    def find_by_name_or_id(self, player, target):
+        # COMPAT: minqlxtended's Plugin.player() raises NonexistentPlayerError for an
+        # empty client slot, but the iouonegirl superclass only expects ValueError there,
+        # so e.g. "!spec 31" with slot 31 empty died silently. Catch it here so a bad
+        # numeric ID fails with a message. Name and ID matching are otherwise unchanged.
+        try:
+            return super().find_by_name_or_id(player, target)
+        except minqlxtended.NonexistentPlayerError:
+            player.tell("Sorry, but no players matched your tokens: {}.".format(target))
+            return None
+
     def handle_player_connect(self, player, is_bot):
         self.update_player(player)
 
@@ -274,17 +285,21 @@ class myessentials(iouonegirlPlugin):
 
         return minqlxtended.Return.STOP_ALL
 
+    # COMPAT: minqlxtended removed the Plugin.shuffle/pause/unpause/slap/slay/switch/
+    # lock/unlock/allready/abort convenience wrappers that classic minqlx had; they now
+    # live on Game. Calling them on self raised AttributeError, which the command
+    # dispatcher swallows silently. Route them through self.game like stock essentials.
     def cmd_shuffle(self, player, msg, channel):
         """Forces a shuffle instantly."""
-        self.shuffle()
+        self.game.shuffle()
 
     def cmd_pause(self, player, msg, channel):
         """Pauses the game."""
-        self.pause()
+        self.game.pause()
 
     def cmd_unpause(self, player, msg, channel):
         """Unpauses the game."""
-        self.unpause()
+        self.game.unpause()
 
     def cmd_slap(self, player, msg, channel):
         """Slaps a player with optional damage."""
@@ -304,7 +319,7 @@ class myessentials(iouonegirlPlugin):
         else:
             dmg = 0
 
-        self.slap(target_player, dmg)
+        self.game.slap(target_player, dmg)  # COMPAT: Plugin.slap was removed
         return minqlxtended.Return.STOP_EVENT
 
     def cmd_slay(self, player, msg, channel):
@@ -316,7 +331,7 @@ class myessentials(iouonegirlPlugin):
         if not target_player:
             return minqlxtended.Return.STOP_EVENT
 
-        self.slay(target_player)
+        self.game.slay(target_player)  # COMPAT: Plugin.slay was removed
         return minqlxtended.Return.STOP_ALL
 
     def cmd_enable_sounds(self, player, msg, channel):
@@ -470,7 +485,14 @@ class myessentials(iouonegirlPlugin):
         if not player2:
             return minqlxtended.Return.STOP_EVENT
 
-        self.switch(player1, player2)
+        # COMPAT: Plugin.switch was removed; Game.switch replaces it and raises
+        # ValueError (e.g. both players on the same team), so reply instead of
+        # letting the dispatcher swallow it silently.
+        try:
+            self.game.switch(player1, player2)
+        except ValueError as e:
+            channel.reply("^1{}".format(e))
+            return minqlxtended.Return.STOP_EVENT
 
     def cmd_red(self, player, msg, channel):
         """Moves a player to the red team."""
@@ -580,43 +602,43 @@ class myessentials(iouonegirlPlugin):
         """Lock a team."""
         if len(msg) > 1:
             if msg[1][0].lower() == "s":
-                self.after_command(lambda: self.lock("spectator"))
+                self.after_command(lambda: self.game.lock("spectator"))
             elif msg[1][0].lower() == "r":
-                self.after_command(lambda: self.lock("red"))
+                self.after_command(lambda: self.game.lock("red"))
             elif msg[1][0].lower() == "b":
-                self.after_command(lambda: self.lock("blue"))
+                self.after_command(lambda: self.game.lock("blue"))
             else:
                 player.tell("Invalid team.")
                 return minqlxtended.Return.STOP_ALL
         else:
-            self.after_command(lambda: self.lock())
+            self.after_command(lambda: self.game.lock())
 
     def cmd_unlock(self, player, msg, channel):
         """Unlock a team."""
         if len(msg) > 1:
             if msg[1][0].lower() == "s":
-                self.after_command(lambda: self.unlock("spectator"))
+                self.after_command(lambda: self.game.unlock("spectator"))
             elif msg[1][0].lower() == "r":
-                self.after_command(lambda: self.unlock("red"))
+                self.after_command(lambda: self.game.unlock("red"))
             elif msg[1][0].lower() == "b":
-                self.after_command(lambda: self.unlock("blue"))
+                self.after_command(lambda: self.game.unlock("blue"))
             else:
                 player.tell("Invalid team.")
                 return minqlxtended.Return.STOP_ALL
         else:
-            self.after_command(lambda: self.unlock())
+            self.after_command(lambda: self.game.unlock())
 
     def cmd_allready(self, player, msg, channel):
         """Forces all players to ready up."""
         if self.game.state == "warmup":
-            self.allready()
+            self.game.allready()  # COMPAT: Plugin.allready was removed
         else:
             channel.reply("But the game's already in progress, you silly goose!")
 
     def cmd_abort(self, player, msg, channel):
         """Forces a game in progress to go back to warmup."""
         if self.game.state != "warmup":
-            self.abort()
+            self.game.abort()  # COMPAT: Plugin.abort was removed
         else:
             channel.reply("But the game isn't even on, you doofus!")
 
