@@ -1,66 +1,5 @@
 """
 mymaps.py - map command override with optional map-pool-aware factory resolution.
-
-Purpose
--------
-Overrides !map <mapname> [factory] to support map-pool-aware factory selection when enabled.
-For native /callvote map votes, an independent toggle enables the same selection.
-Votes without a factory are reissued as player commands with the resolved factory,
-then the original attempt is blocked. Native validation and vote text are preserved.
-/callvote <mapname> is also supported for pool maps and, on minqlxtended, installed
-maps. Other vote names are left alone. Use /callvote map <mapname> to avoid ambiguity
-with custom votes whose names happen to match installed maps.
-Map-vote arguments also tolerate a redundant leading "map" keyword.
-Diagnostic INFO logs record hook entry, parsing, resolution, command delivery,
-active-vote state and the final STOP_ALL return; delivery alone is not acceptance.
-
-Enabled behavior (!map <mapname> [factory]):
-  1) If [factory] is explicitly provided, use it.
-  2) If [factory] is omitted and map is listed in sv_mapPoolFile/sv_mappoolfile, use pool factory.
-  3) For an unlisted map, use nonblank qlx_defaultFactory.
-  4) Otherwise use the currently running factory.
-  5) If no factory can be resolved, log an error and notify the caller without loading.
-
-Disabled behavior:
-  Faithfully reimplements stock !map behavior from essentials, rather than delegating
-  to a potentially customized handler. No pool/default-factory lookup is performed:
-    self.change_map(msg[1], msg[2] if len(msg) > 2 else None)
-
-Install / load notes
---------------------
-- This plugin registers "map"/"changemap" at PRI_HIGHEST and returns RET_STOP_ALL after handling.
-  That gives it precedence over lower-priority handlers, including essentials.
-- Keep essentials or its replacement myessentials loaded for other commands/features.
-  Do not load both: myessentials automatically unloads essentials.
-- If another plugin also registers !map at PRI_HIGHEST, load order between those two will matter.
-  Unload that competing override (including a separate map.py), or load mymaps first.
-- Supports minqlx and minqlxtended; add_command is the command-registration API,
-  not console_command (which executes an engine command).
-- Relative pool paths resolve under fs_homepath/baseq3, then fs_basepath/baseq3.
-  Absolute pool paths are supported. Parsed pools are cached by path and stat fingerprint;
-  edits are picked up on the next command, without reloading the plugin.
-- !map factory IDs are passed through to QL for validation, including qlx_defaultFactory.
-- Callvote uses vote_called, client_command and is_vote_active on either framework.
-  Shorthand for unlisted maps additionally requires minqlxtended's map_info API.
-- g_voteFlags bit 8 may prohibit factory arguments in native map votes. Rewriting is
-  skipped with a warning when set (or when flags cannot be read). An administrator
-  must clear that bit to enable rewriting; explicit factories are left to QL.
-- Missing/unreadable pools leave votes unchanged. Rejected rewrites are logged and
-  the original command is replayed once, without further rewriting. This fallback
-  is best-effort: native validation, other plugins or a disconnected caller can
-  still reject it. client_command's return value alone does not confirm acceptance.
-
-Custom Cvars
-------------
-- qlx_mymaps_enable (default: "1")
-    1/on/true/yes  -> enabled (map-pool-aware resolution)
-    0/off/false/no -> disabled (stock !map behavior)
-- qlx_mymaps_vote_enable (default: "1")
-    1/on/true/yes  -> enable factory resolution for native map votes
-    0/off/false/no -> leave map votes untouched
-- qlx_defaultFactory (default: "", string)
-    Factory for unlisted maps when no explicit factory is supplied. Empty/blank means
-    use the currently running factory. Toggles and default are read live.
 """
 
 import os
@@ -89,6 +28,7 @@ class mymaps(minqlx.Plugin):
         self.set_cvar_once("qlx_mymaps_enable", "1")
         self.set_cvar_once("qlx_mymaps_vote_enable", "1")
         self.set_cvar_once("qlx_defaultFactory", "")
+        self.set_cvar_once("qlx_enforceMappool", "0")
 
         # Simple in-memory cache for parsed map pool, invalidated by file mtime/path changes.
         self._cached_pool_path = None
@@ -107,11 +47,9 @@ class mymaps(minqlx.Plugin):
         self.logger.info("mymaps diagnostics ready: vote_called hook registered.")
 
     def handle_vote_called(self, caller, vote, args):
-        # Diagnostic 1: raw hook inputs, before every early return.
         self.logger.info(
             f"vote_called ENTER: vote={vote!r} args={args!r} caller={caller.name if caller else 'server'}"
         )
-        # Native callvote detection; reissued commands must not recurse into resolution.
         if self._reissuing_vote:
             self.logger.info("vote_called SKIP: reissued command; recursion guard active.")
             return
@@ -125,7 +63,6 @@ class mymaps(minqlx.Plugin):
         vote_name = vote.strip()
         parts = args.split()
         if vote_name.lower() == "map":
-            # Native args omit "map"; tolerate a redundant keyword from other callers.
             if parts and parts[0].lower() == "map":
                 parts = parts[1:]
         elif not parts and self._is_map_vote_shorthand(vote_name):
@@ -139,7 +76,7 @@ class mymaps(minqlx.Plugin):
         map_name = parts[0]
         explicit_factory = parts[1] if len(parts) == 2 else None
         self.logger.info("Map vote parsed: map=%r explicit_factory=%r.", map_name, explicit_factory)
-        # Reuse !map's priority chain, but fail open when the pool cannot be read.
+
         factory, rule = self._resolve_factory_details(map_name, explicit_factory, require_pool=True)
         self.logger.info("Map vote resolved: map=%r factory=%r rule=%r.", map_name, factory, rule)
         if not factory:
@@ -185,14 +122,12 @@ class mymaps(minqlx.Plugin):
         )
         self._reissuing_vote = True
         try:
-            # Diagnostic 2: immediately before attempting the rewritten command.
             self.logger.info(f"REWRITING vote: map={map_name!r} factory={factory!r}")
             if self._try_vote_command(caller, command, is_rewrite=True):
                 self.logger.info(
                     "Map vote '%s': %s factory '%s'; rewritten=yes.", map_name, rule, factory
                 )
             else:
-                # Nested client_command replaces engine tokens: replay, then block the outer call.
                 self.logger.error(
                     "Map vote '%s': %s factory '%s'; rewrite rejected, rewritten=no. "
                     "Replaying original vote.", map_name, rule, factory
@@ -209,7 +144,6 @@ class mymaps(minqlx.Plugin):
         delivered = None
         try:
             delivered = minqlx.client_command(caller.id, command)
-            # Diagnostic 3: command returned without raising; QL may still have rejected it.
             if is_rewrite:
                 self.logger.info("REWRITE client_command sent")
             else:
@@ -219,7 +153,6 @@ class mymaps(minqlx.Plugin):
         else:
             if not delivered:
                 self.logger.error("Vote command %r was not delivered.", command)
-        # client_command reports delivery, not QL acceptance. A new active vote is observable.
         active = self.is_vote_active()
         self.logger.info(
             "Vote command result: command=%r delivered=%r active=%r.", command, delivered, active
@@ -254,11 +187,21 @@ class mymaps(minqlx.Plugin):
 
         explicit_factory = msg[2].strip() if len(msg) > 2 and msg[2].strip() else None
 
+        # Enforce map pool restrictions on !map when qlx_enforceMappool is enabled.
+        if self._enforce_mappool_enabled():
+            allowed, canonical_factory = self._validate_against_mappool(
+                map_name, explicit_factory, channel
+            )
+            if not allowed:
+                return STOP_ALL
+            # Use the pool's exact factory string (or default to the first pool factory).
+            explicit_factory = canonical_factory
+
         # Toggle branch:
         # - disabled => reimplement stock !map without pool/default-factory lookup
         # - enabled  => apply enhanced map-pool-aware factory resolution
         if not self._feature_enabled():
-            return self._default_map_behavior(player, msg, channel)
+            return self._load_map(map_name, explicit_factory, channel)
 
         resolved_factory = self._resolve_factory(map_name, explicit_factory)
         if resolved_factory is None:
@@ -273,6 +216,41 @@ class mymaps(minqlx.Plugin):
             return STOP_ALL
 
         return self._load_map(map_name, resolved_factory, channel)
+
+    def _validate_against_mappool(self, map_name, explicit_factory, channel):
+        """
+        Validates (map_name, explicit_factory) against the configured map pool.
+        Returns (True, resolved_pool_factory) if allowed, or (False, None) if blocked.
+        """
+        pool = self._parse_map_pool()
+        if not pool:
+            self.logger.warning(
+                "qlx_enforceMappool is enabled, but map pool could not be loaded; blocking !map %s.",
+                map_name,
+            )
+            channel.reply("^1Cannot change map: qlx_enforceMappool is enabled, but the map pool is unavailable.")
+            return False, None
+
+        allowed_factories = pool.get(map_name.lower())
+        if not allowed_factories:
+            channel.reply(
+                "^1Map '^7{}^1' is not in the map pool (qlx_enforceMappool is enabled).".format(map_name)
+            )
+            return False, None
+
+        if explicit_factory:
+            for factory in allowed_factories:
+                if factory.lower() == explicit_factory.lower():
+                    return True, factory
+            channel.reply(
+                "^1Factory '^7{}^1' is not allowed for '^7{}^1'. Allowed: ^7{}^1.".format(
+                    explicit_factory, map_name, ", ".join(allowed_factories)
+                )
+            )
+            return False, None
+
+        # No factory specified: enforce the first pool factory for this map.
+        return True, allowed_factories[0]
 
     def _load_map(self, map_name, factory, channel):
         try:
@@ -293,44 +271,40 @@ class mymaps(minqlx.Plugin):
         return default if value is None else value
 
     def _feature_enabled(self):
-        return self._enabled_cvar("qlx_mymaps_enable")
+        return self._enabled_cvar("qlx_mymaps_enable", default="1")
 
     def _vote_feature_enabled(self):
-        return self._enabled_cvar("qlx_mymaps_vote_enable")
+        return self._enabled_cvar("qlx_mymaps_vote_enable", default="1")
 
-    def _enabled_cvar(self, name):
-        raw_value = self._read_cvar(name, "1")
+    def _enforce_mappool_enabled(self):
+        return self._enabled_cvar("qlx_enforceMappool", default="0")
+
+    def _enabled_cvar(self, name, default="1"):
+        raw_value = self._read_cvar(name, default)
         normalized = raw_value.strip().lower()
         if normalized in {"1", "true", "on", "yes"}:
             return True
         if normalized in {"0", "false", "off", "no"}:
             return False
 
+        fallback = default.strip().lower() in {"1", "true", "on", "yes"}
         self.logger.warning(
             "Invalid %s value '%s'. Expected 0/1 (or true/false/on/off). "
-            "Falling back to enabled.",
+            "Falling back to %s.",
             name,
             raw_value,
+            "enabled" if fallback else "disabled",
         )
-        return True
+        return fallback
 
     def _get_default_factory_cvar(self):
         return self._read_cvar("qlx_defaultFactory").strip()
-
-    def _default_map_behavior(self, player, msg, channel):
-        return self._load_map(msg[1], msg[2] if len(msg) > 2 else None, channel)
 
     def _resolve_factory(self, map_name, explicit_factory):
         factory, _ = self._resolve_factory_details(map_name, explicit_factory)
         return factory
 
     def _resolve_factory_details(self, map_name, explicit_factory, require_pool=False):
-        # Factory resolution decision tree (enabled mode):
-        # 1) explicit factory argument wins
-        # 2) else map-pool factory for listed maps
-        # 3) else nonblank qlx_defaultFactory
-        # 4) else currently running factory
-        # 5) else fail without issuing a map command
         if explicit_factory:
             return self._resolved_factory(map_name, explicit_factory, "explicit"), "explicit"
 
@@ -338,9 +312,9 @@ class mymaps(minqlx.Plugin):
         if pool is None and require_pool:
             return None, None
         if pool:
-            pool_factory = pool.get(map_name.lower())
-            if pool_factory:
-                return self._resolved_factory(map_name, pool_factory, "pool"), "pool"
+            pool_factories = pool.get(map_name.lower())
+            if pool_factories:
+                return self._resolved_factory(map_name, pool_factories[0], "pool"), "pool"
 
         default_factory = self._get_default_factory_cvar()
         if default_factory:
@@ -415,18 +389,9 @@ class mymaps(minqlx.Plugin):
                         continue
 
                     key = map_name.lower()
-                    if key in parsed and parsed[key] != factory:
-                        self.logger.warning(
-                            "Duplicate map '%s' in '%s' line %d. Keeping '%s', ignoring '%s'.",
-                            map_name,
-                            pool_path,
-                            line_number,
-                            parsed[key],
-                            factory,
-                        )
-                        continue
-
-                    parsed[key] = factory
+                    factories = parsed.setdefault(key, [])
+                    if not any(existing.lower() == factory.lower() for existing in factories):
+                        factories.append(factory)
         except (OSError, UnicodeError) as exc:
             self.logger.warning("Could not read map pool file '%s': %s", pool_path, exc)
             self._clear_pool_cache()
